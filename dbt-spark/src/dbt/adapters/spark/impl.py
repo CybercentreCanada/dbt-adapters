@@ -36,10 +36,15 @@ from dbt.adapters.sql import SQLAdapter
 from dbt.adapters.spark import SparkConnectionManager
 from dbt.adapters.spark import SparkRelation
 from dbt.adapters.spark import SparkColumn
+
+# CCCS
 from dbt.adapters.spark.python_submissions import (
     JobClusterPythonJobHelper,
     AllPurposeClusterPythonJobHelper,
+    SparkSessionBasedClusterPythonJobHelper,
 )
+from dbt.adapters.capability import CapabilityDict, CapabilitySupport, Support, Capability
+
 from dbt.adapters.base import BaseRelation
 from dbt.adapters.contracts.relation import RelationType, RelationConfig
 from dbt_common.clients.agate_helper import DEFAULT_TYPE_TESTER
@@ -120,6 +125,11 @@ class SparkAdapter(SQLAdapter):
         ConstraintType.foreign_key: ConstraintSupport.NOT_ENFORCED,
     }
 
+    # CCCS
+    _capabilities = CapabilityDict(
+        {Capability.SchemaMetadataByRelations: CapabilitySupport(support=Support.Full)}
+    )
+
     Relation: TypeAlias = SparkRelation
     RelationInfo = Tuple[str, str, str]
     Column: TypeAlias = SparkColumn
@@ -180,7 +190,11 @@ class SparkAdapter(SQLAdapter):
                 f'Invalid value from "show tables ...", got {len(row)} values, expected 3'
             )
 
-        table_name = f"{_schema}.{name}"
+        # CCCS retrieve the database from the dbt_project.yml. Note we could also
+        # pass it in from  list_relations_without_caching it has the full name
+        # kwargs = {"schema_relation": schema_relation}
+        database = self.config.models.get("+database")
+        table_name = f"{database}.{_schema}.{name}"
         try:
             table_results = self.execute_macro(
                 DESCRIBE_TABLE_EXTENDED_MACRO_NAME, kwargs={"table_name": table_name}
@@ -216,7 +230,12 @@ class SparkAdapter(SQLAdapter):
             is_hudi: bool = "Provider: hudi" in information
             is_iceberg: bool = "Provider: iceberg" in information
 
+            # CCCS retrieve the database from the dbt_project.yml. Note we could also
+            # pass it in from  list_relations_without_caching it has the full name
+            # kwargs = {"schema_relation": schema_relation}
+            database = self.config.models.get("+database")
             relation: BaseRelation = self.Relation.create(
+                database=database,
                 schema=_schema,
                 identifier=name,
                 type=rel_type,
@@ -291,8 +310,9 @@ class SparkAdapter(SQLAdapter):
         raw_table_stats = metadata.get(KEY_TABLE_STATISTICS)
         table_stats = SparkColumn.convert_table_stats(raw_table_stats)
         return [
+            # CCCS pass in the relation.database
             SparkColumn(
-                table_database=None,
+                table_database=relation.database,
                 table_schema=relation.schema,
                 table_name=relation.name,
                 table_type=relation.type,
@@ -349,8 +369,9 @@ class SparkAdapter(SQLAdapter):
         table_stats = SparkColumn.convert_table_stats(raw_table_stats)
         for match_num, match in enumerate(matches):
             column_name, column_type, nullable = match.groups()
+            # CCCS
             column = SparkColumn(
-                table_database=None,
+                table_database=relation.database,
                 table_schema=relation.schema,
                 table_name=relation.table,
                 table_type=relation.type,
@@ -364,7 +385,23 @@ class SparkAdapter(SQLAdapter):
         return columns
 
     def _get_columns_for_catalog(self, relation: BaseRelation) -> Iterable[Dict[str, Any]]:
-        columns = self.parse_columns_from_information(relation)
+        # CCCS
+        if relation.is_iceberg:
+            # Iceberg information column does not contain the relation's schema (columns)
+            # Instead of parsing the information column we use the get_columns_in_relation macro
+            # this macro executes 'describe extended <table name>' which returns the column
+            # names and their type
+            rows: List[agate.Row] = super().get_columns_in_relation(relation)
+            columns = self.parse_describe_extended(relation, rows)
+            for column in columns:
+                # convert SparkColumns into catalog dicts
+                as_dict = column.to_column_dict()
+                as_dict["column_name"] = as_dict.pop("column", None)
+                as_dict["column_type"] = as_dict.pop("dtype")
+                as_dict["table_database"] = relation.database if relation.is_iceberg else None
+                yield as_dict
+        else:
+            columns = self.parse_columns_from_information(relation)
 
         for column in columns:
             # convert SparkColumns into catalog dicts
@@ -380,10 +417,12 @@ class SparkAdapter(SQLAdapter):
         used_schemas: FrozenSet[Tuple[str, str]],
     ) -> Tuple["agate.Table", List[Exception]]:
         schema_map = self._get_catalog_schemas(relation_configs)
-        if len(schema_map) > 1:
-            raise CompilationError(
-                f"Expected only one database in get_catalog, found " f"{list(schema_map)}"
-            )
+        # CCCS
+        # In iceberg there can be multiple catalogs.
+        # if len(schema_map) > 1:
+        #     raise CompilationError(
+        #         f"Expected only one database in get_catalog, found " f"{list(schema_map)}"
+        #     )
 
         with executor(self.config) as tpe:
             futures: List[Future["agate.Table"]] = []
@@ -420,6 +459,43 @@ class SparkAdapter(SQLAdapter):
         for relation in self.list_relations(database, schema):
             logger.debug("Getting table schema for relation {}", str(relation))
             columns.extend(self._get_columns_for_catalog(relation))
+
+        import agate
+
+        return agate.Table.from_object(columns, column_types=DEFAULT_TYPE_TESTER)
+
+    # CCCS
+    def _get_one_catalog_by_relations(
+        self,
+        information_schema: InformationSchema,
+        relations: List[SparkRelation],
+        used_schemas: FrozenSet[Tuple[str, str]],
+    ) -> "agate.Table":
+        """
+        Overwrite of _get_one_catalog_by_relations for Spark, in order to prevent listing
+        all tables in schemas and then finding their columns.
+        This function is invoked by Adapter.get_catalog_by_relations.
+
+        Note CCCS: I'm hard coding the fact that relations are tables and of type Iceberg.
+        For some reason the SparkRelation provided do not state what is there `type`
+        nor does it state if they are huidi, delta or iceberg.
+        """
+
+        columns: List[Dict[str, Any]] = []
+        for relation in relations:
+            r: BaseRelation = self.Relation.create(
+                database=relation.database,
+                schema=relation.schema,
+                identifier=relation.identifier,
+                type=RelationType.Table,
+                information=relation.information,
+                is_delta=False,
+                is_iceberg=True,
+                is_hudi=False,
+            )
+
+            logger.debug("Getting table schema for relation {}", str(r))
+            columns.extend(self._get_columns_for_catalog(r))
 
         import agate
 
@@ -492,9 +568,11 @@ class SparkAdapter(SQLAdapter):
 
     @property
     def python_submission_helpers(self) -> Dict[str, Type[PythonJobHelper]]:
+        # CCCS
         return {
             "job_cluster": JobClusterPythonJobHelper,
             "all_purpose_cluster": AllPurposeClusterPythonJobHelper,
+            "spark_session_based_cluster": SparkSessionBasedClusterPythonJobHelper,
         }
 
     def standardize_grants_dict(self, grants_table: "agate.Table") -> dict:

@@ -292,20 +292,22 @@
   {% do return(load_result('get_columns_in_relation').table) %}
 {% endmacro %}
 
-{% macro spark__list_relations_without_caching(relation) %}
+{# CCCS use full schema name including catalog #}
+{% macro spark__list_relations_without_caching(schema_relation) %}
   {% call statement('list_relations_without_caching', fetch_result=True) -%}
-    show table extended in {{ relation.schema }} like '*'
+    show table extended in {{ schema_relation }} like '*'
   {% endcall %}
 
   {% do return(load_result('list_relations_without_caching').table) %}
 {% endmacro %}
 
+{# CCCS use full schema name including catalog #}
 {% macro list_relations_show_tables_without_caching(schema_relation) %}
   {#-- Spark with iceberg tables don't work with show table extended for #}
   {#-- V2 iceberg tables #}
   {#-- https://issues.apache.org/jira/browse/SPARK-33393 #}
   {% call statement('list_relations_without_caching_show_tables', fetch_result=True) -%}
-    show tables in {{ schema_relation.schema }} like '*'
+    show tables in {{ schema_relation }} like '*'
   {% endcall %}
 
   {% do return(load_result('list_relations_without_caching_show_tables').table) %}
@@ -347,11 +349,6 @@
     drop {{ relation.type }} if exists {{ relation }}
   {%- endcall %}
 {% endmacro %}
-
-
-{% macro spark__generate_database_name(custom_database_name=none, node=none) -%}
-  {% do return(None) %}
-{%- endmacro %}
 
 {% macro spark__persist_docs(relation, model, for_relation, for_columns) -%}
   {% if for_columns and config.persist_column_docs() and model.columns %}
