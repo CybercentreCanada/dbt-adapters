@@ -320,4 +320,4 @@ class SparkSessionBasedClusterPythonJobHelper(PythonJobHelper):
             exec(fix_code, locals())
         except Exception as e:
             print(f"There's an issue with the Python model. See trace: {traceback.format_exc()}")
-            raise DbtRuntimeError(f"The Python model failed with traceback: {e}")
+            raise DbtRuntimeError("The Python model failed") from e
