@@ -299,7 +299,6 @@ class AllPurposeClusterPythonJobHelper(BaseDatabricksHelper):
             finally:
                 context.destroy(context_id)
 
-
 # CCCS
 class SparkSessionBasedClusterPythonJobHelper(PythonJobHelper):
     """
@@ -315,7 +314,10 @@ class SparkSessionBasedClusterPythonJobHelper(PythonJobHelper):
 
             spark = SparkSession.builder.getOrCreate()  # Local passed to compiled_code call
             model_config = deepcopy(self.parsed_model.get("config"))
-            exec(compiled_code, locals())
+            # When a python model with incremental_strategy: microbatch, the date code needs to be fixed,
+            # This line is inserted into python models but the <UTC> is not valid python code config_dict = {'__dbt_internal_microbatch_event_time_start': datetime.datetime(2025, 7, 30, 0, 0, tzinfo=<UTC>), '__dbt_internal_microbatch_event_time_end': datetime.datetime(2025, 7, 30, 1, 0, tzinfo=<UTC>), 'target': {}}
+            fix_code = compiled_code.replace("<UTC>", "datetime.timezone.utc")
+            exec(fix_code, locals())
         except Exception as e:
             print(f"There's an issue with the Python model. See trace: {traceback.format_exc()}")
-            raise dbt.exceptions.RuntimeException(f"The Python model failed with traceback: {e}")
+            raise DbtRuntimeError("The Python model failed") from e

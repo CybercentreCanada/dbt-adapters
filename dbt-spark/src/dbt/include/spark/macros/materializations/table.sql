@@ -103,19 +103,62 @@ else:
   msg = f"{type(df)} is not a supported type for dbt Python materialization"
   raise Exception(msg)
 
-{# CCCS #}
+{# CCCS, use DataFrameV2 for its support of tblproperties #}
 if {{ temporary }}:
   df.createOrReplaceTempView("{{ target_relation }}")
 else:
-  writer = df.write.mode("overwrite").format("{{ config.get('file_format', 'delta') }}").option("overwriteSchema", "true")
-  {% if partition_cols() -%}
-  writer = writer.partitionBy('{{ partition_cols() | trim }}'.strip("()").split(","))
-  {%- endif %}
+  {# Import functions that can be used for partitioning See https://spark.apache.org/docs/3.5.5/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrameWriterV2.partitionedBy.html #}
+  from pyspark.sql.functions import years, months, days, hours, bucket
+  writer = df.writeTo("{{ target_relation }}") \
+    .using("{{ config.get('file_format', 'delta') }}") \
+    .option("overwriteSchema", "true")
+  
+  {{ python__partitionedBy_clause() }}
   {% if location_clause() -%}
   writer = writer.option("path", "{{ location_clause() | trim }}".split("'")[1])
   {%- endif %}
-  writer.saveAsTable("{{ target_relation }}")
+  {{ python__tblproperties_clause() }}
+
+  writer.create()
   {%- endmacro -%}
+
+{% macro python__partitionedBy_clause() %}
+  {% if partition_cols() -%}
+    {% set partition_cols = (partition_cols() | trim) %}
+    
+    {# Remove the first character if this character is '(' #}
+    {% if partition_cols[0] == '(' %}
+      {% set partition_cols = partition_cols[1:] %}
+    {% endif %}
+
+      {# Remove the last character if this character is ')' #}
+    {% if partition_cols[-1] == ')' %}
+      {% set partition_cols = partition_cols[:-1] %}
+    {% endif %}
+    
+    {% set partitions = partition_cols.split(",") %}
+    {% set partitions_quoted = [] %}
+    {% for partition in partitions %}
+      {% if not ((partition.startswith('years') or partition.startswith('months') or partition.startswith('days') or partition.startswith('hours') or partition.startswith('bucket') )) %}
+        {% do partitions_quoted.append("'" ~ partition ~ "'") %}
+      {% else%}
+        {% do partitions_quoted.append(partition) %}
+      {% endif %}
+    {% endfor %}
+    {% if partitions_quoted is defined and (partitions_quoted | length) > 0 %}
+  writer = writer.partitionedBy({{ partitions_quoted | join(",") }})
+    {% endif %}
+  {%- endif %}
+{%- endmacro -%}
+
+{% macro python__tblproperties_clause() %}
+  {%- set tblproperties = config.get('tblproperties') -%}
+  {%- if tblproperties is not none %}
+      {% for prop in tblproperties %}
+  writer = writer.tableProperty("{{ prop }}", "{{ tblproperties[prop] }}")
+      {%- endfor %}
+  {%- endif %}
+{%- endmacro -%}
 
 {%macro py_script_comment()%}
 # how to execute python model in notebook

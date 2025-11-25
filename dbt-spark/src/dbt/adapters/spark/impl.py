@@ -170,7 +170,8 @@ class SparkAdapter(SQLAdapter):
     def quote(self, identifier: str) -> str:  # type:ignore
         return "`{}`".format(identifier)
 
-    def _get_relation_information(self, row: "agate.Row") -> RelationInfo:
+    # CCCS schema_relation added to the method signature
+    def _get_relation_information(self, row: "agate.Row", schema_relation: BaseRelation) -> RelationInfo:
         """relation info was fetched with SHOW TABLES EXTENDED"""
         try:
             _schema, name, _, information = row
@@ -181,7 +182,8 @@ class SparkAdapter(SQLAdapter):
 
         return _schema, name, information
 
-    def _get_relation_information_using_describe(self, row: "agate.Row") -> RelationInfo:
+    # CCCS schema_relation added to get the database
+    def _get_relation_information_using_describe(self, row: "agate.Row", schema_relation: BaseRelation) -> RelationInfo:
         """Relation info fetched using SHOW TABLES and an auxiliary DESCRIBE statement"""
         try:
             _schema, name, _ = row
@@ -193,7 +195,13 @@ class SparkAdapter(SQLAdapter):
         # CCCS retrieve the database from the dbt_project.yml. Note we could also
         # pass it in from  list_relations_without_caching it has the full name
         # kwargs = {"schema_relation": schema_relation}
-        database = self.config.models.get("+database")
+        # database = self.config.models.get("+database")
+        # Can't use config.models database because it may be None or be overridden in the model
+        if schema_relation is not None:
+            database = schema_relation.database
+        else:
+            raise DbtRuntimeError("BaseRelation is required to get the database name")
+
         table_name = f"{database}.{_schema}.{name}"
         try:
             table_results = self.execute_macro(
@@ -214,12 +222,16 @@ class SparkAdapter(SQLAdapter):
     def _build_spark_relation_list(
         self,
         row_list: "agate.Table",
-        relation_info_func: Callable[["agate.Row"], RelationInfo],
+        # CCCS Need to pass the BaseRelation to get the database
+        relation_info_func: Callable[["agate.Row", BaseRelation], RelationInfo],
+        # CCCS Need to pass the schema_relation to get the database
+        schema_relation: BaseRelation,
     ) -> List[BaseRelation]:
         """Aggregate relations with format metadata included."""
         relations = []
         for row in row_list:
-            _schema, name, information = relation_info_func(row)
+            # CCCS pass schema_relation to get the database
+            _schema, name, information = relation_info_func(row, schema_relation)
 
             rel_type: RelationType = (
                 RelationType.View
@@ -233,7 +245,13 @@ class SparkAdapter(SQLAdapter):
             # CCCS retrieve the database from the dbt_project.yml. Note we could also
             # pass it in from  list_relations_without_caching it has the full name
             # kwargs = {"schema_relation": schema_relation}
-            database = self.config.models.get("+database")
+            # database = self.config.models.get("+database")
+            # Can't use config.models database because it may be None or be overridden in the model
+            if schema_relation is not None:
+                database = schema_relation.database
+            else:
+                raise DbtRuntimeError("BaseRelation is required to get the database name")
+
             relation: BaseRelation = self.Relation.create(
                 database=database,
                 schema=_schema,
@@ -253,13 +271,14 @@ class SparkAdapter(SQLAdapter):
         try different methods to fetch relation information."""
 
         kwargs = {"schema_relation": schema_relation}
-
         try:
             # Default compute engine behavior: show tables extended
             show_table_extended_rows = self.execute_macro(LIST_RELATIONS_MACRO_NAME, kwargs=kwargs)
             return self._build_spark_relation_list(
                 row_list=show_table_extended_rows,
                 relation_info_func=self._get_relation_information,
+                # CCCS pass BaseRelation to get destination database
+                schema_relation=schema_relation,
             )
         except DbtRuntimeError as e:
             errmsg = getattr(e, "msg", "")
@@ -277,6 +296,8 @@ class SparkAdapter(SQLAdapter):
                     return self._build_spark_relation_list(
                         row_list=show_table_rows,
                         relation_info_func=self._get_relation_information_using_describe,
+                        # CCCS pass BaseRelation to get destination database
+                        schema_relation=schema_relation,
                     )
                 except DbtRuntimeError as e:
                     description = "Error while retrieving information about"
