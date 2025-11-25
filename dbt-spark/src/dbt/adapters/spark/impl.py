@@ -170,8 +170,8 @@ class SparkAdapter(SQLAdapter):
     def quote(self, identifier: str) -> str:  # type:ignore
         return "`{}`".format(identifier)
 
-    # CCCS base_relation added to the method signature
-    def _get_relation_information(self, row: "agate.Row", base_relation: BaseRelation=None) -> RelationInfo:
+    # CCCS schema_relation added to the method signature
+    def _get_relation_information(self, row: "agate.Row", schema_relation: BaseRelation) -> RelationInfo:
         """relation info was fetched with SHOW TABLES EXTENDED"""
         try:
             _schema, name, _, information = row
@@ -182,8 +182,8 @@ class SparkAdapter(SQLAdapter):
 
         return _schema, name, information
 
-    # CCCS base_relation added to get the database
-    def _get_relation_information_using_describe(self, row: "agate.Row", base_relation: BaseRelation=None) -> RelationInfo:
+    # CCCS schema_relation added to get the database
+    def _get_relation_information_using_describe(self, row: "agate.Row", schema_relation: BaseRelation) -> RelationInfo:
         """Relation info fetched using SHOW TABLES and an auxiliary DESCRIBE statement"""
         try:
             _schema, name, _ = row
@@ -197,8 +197,8 @@ class SparkAdapter(SQLAdapter):
         # kwargs = {"schema_relation": schema_relation}
         # database = self.config.models.get("+database")
         # Can't use config.models database because it may be None or be overridden in the model
-        if base_relation is not None:
-            database = base_relation.database
+        if schema_relation is not None:
+            database = schema_relation.database
         else:
             raise DbtRuntimeError("BaseRelation is required to get the database name")
 
@@ -224,14 +224,14 @@ class SparkAdapter(SQLAdapter):
         row_list: "agate.Table",
         # CCCS Need to pass the BaseRelation to get the database
         relation_info_func: Callable[["agate.Row", BaseRelation], RelationInfo],
-        # CCCS Need to pass the base_relation to get the database
-        base_relation: BaseRelation,
+        # CCCS Need to pass the schema_relation to get the database
+        schema_relation: BaseRelation,
     ) -> List[BaseRelation]:
         """Aggregate relations with format metadata included."""
         relations = []
         for row in row_list:
-            # CCCS pass base_relation to get the database
-            _schema, name, information = relation_info_func(row, base_relation)
+            # CCCS pass schema_relation to get the database
+            _schema, name, information = relation_info_func(row, schema_relation)
 
             rel_type: RelationType = (
                 RelationType.View
@@ -247,8 +247,8 @@ class SparkAdapter(SQLAdapter):
             # kwargs = {"schema_relation": schema_relation}
             # database = self.config.models.get("+database")
             # Can't use config.models database because it may be None or be overridden in the model
-            if base_relation is not None:
-                database = base_relation.database
+            if schema_relation is not None:
+                database = schema_relation.database
             else:
                 raise DbtRuntimeError("BaseRelation is required to get the database name")
 
