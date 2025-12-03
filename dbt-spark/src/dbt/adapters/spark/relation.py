@@ -36,6 +36,7 @@ class SparkRelation(BaseRelation):
     is_iceberg: Optional[bool] = None
     # TODO: make this a dict everywhere
     information: Optional[str] = None
+    require_alias: bool = False
 
     # CCCS
     def __post_init__(self) -> None:

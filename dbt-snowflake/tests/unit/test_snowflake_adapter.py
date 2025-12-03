@@ -55,7 +55,7 @@ class TestSnowflakeAdapter(unittest.TestCase):
         }
         self.config = config_from_parts_or_dicts(project_cfg, profile_cfg)
         self.assertEqual(self.config.query_comment.comment, "dbt")
-        self.assertEqual(self.config.query_comment.append, False)
+        self.assertEqual(self.config.query_comment.append, None)
 
         self.handle = mock.MagicMock(spec=snowflake_connector.SnowflakeConnection)
         self.cursor = self.handle.cursor.return_value
@@ -290,8 +290,10 @@ class TestSnowflakeAdapter(unittest.TestCase):
                     private_key=None,
                     application="dbt",
                     insecure_mode=False,
+                    platform_detection_timeout_seconds=0.0,
                     session_parameters={},
                     reuse_connections=True,
+                    ocsp_root_certs_dict_lock_timeout=10,
                 ),
             ]
         )
@@ -323,8 +325,10 @@ class TestSnowflakeAdapter(unittest.TestCase):
                     private_key=None,
                     application="dbt",
                     insecure_mode=False,
+                    platform_detection_timeout_seconds=0.0,
                     session_parameters={},
                     reuse_connections=None,
+                    ocsp_root_certs_dict_lock_timeout=10,
                 )
             ]
         )
@@ -351,7 +355,9 @@ class TestSnowflakeAdapter(unittest.TestCase):
                     private_key=None,
                     application="dbt",
                     insecure_mode=False,
+                    platform_detection_timeout_seconds=0.0,
                     session_parameters={"QUERY_TAG": "test_query_tag"},
+                    ocsp_root_certs_dict_lock_timeout=10,
                 )
             ]
         )
@@ -385,8 +391,10 @@ class TestSnowflakeAdapter(unittest.TestCase):
                     private_key=None,
                     application="dbt",
                     insecure_mode=False,
+                    platform_detection_timeout_seconds=0.0,
                     session_parameters={},
                     reuse_connections=True,
+                    ocsp_root_certs_dict_lock_timeout=10,
                 )
             ]
         )
@@ -419,8 +427,10 @@ class TestSnowflakeAdapter(unittest.TestCase):
                     client_request_mfa_token=True,
                     client_store_temporary_credential=True,
                     insecure_mode=False,
+                    platform_detection_timeout_seconds=0.0,
                     session_parameters={},
                     reuse_connections=True,
+                    ocsp_root_certs_dict_lock_timeout=10,
                 )
             ]
         )
@@ -449,8 +459,10 @@ class TestSnowflakeAdapter(unittest.TestCase):
                     client_request_mfa_token=True,
                     client_store_temporary_credential=True,
                     insecure_mode=False,
+                    platform_detection_timeout_seconds=0.0,
                     session_parameters={},
                     reuse_connections=True,
+                    ocsp_root_certs_dict_lock_timeout=10,
                 )
             ]
         )
@@ -483,8 +495,10 @@ class TestSnowflakeAdapter(unittest.TestCase):
                     client_request_mfa_token=True,
                     client_store_temporary_credential=True,
                     insecure_mode=False,
+                    platform_detection_timeout_seconds=0.0,
                     session_parameters={},
                     reuse_connections=True,
+                    ocsp_root_certs_dict_lock_timeout=10,
                 )
             ]
         )
@@ -517,8 +531,10 @@ class TestSnowflakeAdapter(unittest.TestCase):
                     private_key="test_key",
                     application="dbt",
                     insecure_mode=False,
+                    platform_detection_timeout_seconds=0.0,
                     session_parameters={},
                     reuse_connections=True,
+                    ocsp_root_certs_dict_lock_timeout=10,
                 )
             ]
         )
@@ -551,8 +567,10 @@ class TestSnowflakeAdapter(unittest.TestCase):
                     private_key="test_key",
                     application="dbt",
                     insecure_mode=False,
+                    platform_detection_timeout_seconds=0.0,
                     session_parameters={},
                     reuse_connections=True,
+                    ocsp_root_certs_dict_lock_timeout=10,
                 )
             ]
         )
@@ -583,8 +601,10 @@ class TestSnowflakeAdapter(unittest.TestCase):
                     client_request_mfa_token=True,
                     client_store_temporary_credential=True,
                     insecure_mode=False,
+                    platform_detection_timeout_seconds=0.0,
                     session_parameters={},
                     reuse_connections=True,
+                    ocsp_root_certs_dict_lock_timeout=10,
                 )
             ]
         )
@@ -613,8 +633,10 @@ class TestSnowflakeAdapter(unittest.TestCase):
                     private_key=None,
                     application="dbt",
                     insecure_mode=False,
+                    platform_detection_timeout_seconds=0.0,
                     session_parameters={"QUERY_TAG": "test_query_tag"},
                     reuse_connections=True,
+                    ocsp_root_certs_dict_lock_timeout=10,
                 )
             ]
         )
@@ -642,8 +664,10 @@ class TestSnowflakeAdapter(unittest.TestCase):
                     private_key=None,
                     application="dbt",
                     insecure_mode=False,
+                    platform_detection_timeout_seconds=0.0,
                     session_parameters={},
                     reuse_connections=True,
+                    ocsp_root_certs_dict_lock_timeout=10,
                 )
             ]
         )
@@ -676,8 +700,10 @@ class TestSnowflakeAdapter(unittest.TestCase):
                     private_key="test_key",
                     application="dbt",
                     insecure_mode=False,
+                    platform_detection_timeout_seconds=0.0,
                     session_parameters={},
                     reuse_connections=True,
+                    ocsp_root_certs_dict_lock_timeout=10,
                 )
             ]
         )
@@ -712,11 +738,33 @@ class TestSnowflakeAdapter(unittest.TestCase):
                     private_key="test_key",
                     application="dbt",
                     insecure_mode=False,
+                    platform_detection_timeout_seconds=0.0,
                     session_parameters={},
                     reuse_connections=True,
+                    ocsp_root_certs_dict_lock_timeout=10,
                 )
             ]
         )
+
+    def test_get_relation_without_quotes(self):
+        with mock.patch.object(self.adapter, "list_relations") as list_relations:
+            list_relations.return_value = [
+                SnowflakeAdapter.Relation.create(
+                    database="TEST_DATABASE", schema="test_schema", identifier="TEST_TABLE"
+                )
+            ]
+            relation = self.adapter.get_relation("test_database", "test_schema", "test_table")
+            assert relation.render() == "TEST_DATABASE.test_schema.TEST_TABLE"
+
+    def test_get_relation_with_quotes(self):
+        with mock.patch.object(self.adapter, "list_relations") as list_relations:
+            list_relations.return_value = [
+                SnowflakeAdapter.Relation.create(
+                    database="test_database", schema="test_schema", identifier="test_TABLE"
+                )
+            ]
+            relation = self.adapter.get_relation('"test_database"', "test_schema", '"test_TABLE"')
+            assert relation.render() == "test_database.test_schema.test_TABLE"
 
 
 class TestSnowflakeAdapterConversions(TestAdapterConversions):
@@ -875,6 +923,88 @@ class TestSnowflakeColumn(unittest.TestCase):
         assert col.is_numeric() is False
         assert col.is_string() is False
         assert col.is_integer() is False
+
+
+class TestSnowflakeColumnStructuredTypes(unittest.TestCase):
+    """
+    https://docs.snowflake.com/en/sql-reference/data-types-structured
+
+    Structured types would require a complete AST to fully parse through these types.
+    For now, we opt for treating these as opaque strings of the type TYPE(INFO)
+    where INFO could be types, sizes, or configuration params.
+    """
+
+    def test_array_from_description(self):
+        """Documented example of optional NOT NULL param in the array type declaration"""
+        col = SnowflakeColumn.from_description("my_col", "ARRAY(VARCHAR(16777216) NOT NULL)")
+        assert col.column == "my_col"
+        assert col.dtype == "ARRAY(VARCHAR(16777216) NOT NULL)"
+        assert col.char_size is None
+        assert col.numeric_precision is None
+        assert col.numeric_scale is None
+        assert col.is_float() is False
+        assert col.is_number() is False
+        assert col.is_numeric() is False
+        assert col.is_string() is False
+        assert col.is_integer() is False
+        assert col.is_array() is True
+        assert col.is_object() is False
+        assert col.is_map() is False
+
+    def test_object_from_description_iceberg(self):
+        """Iceberg tables allow for extended type descriptions in OBJECT types"""
+        col = SnowflakeColumn.from_description(
+            "my_col",
+            "OBJECT(languagePreference VARCHAR(16777216), localePreference VARCHAR(16777216))",
+        )
+        assert col.column == "my_col"
+        assert (
+            col.dtype
+            == "OBJECT(languagePreference VARCHAR(16777216), localePreference VARCHAR(16777216))"
+        )
+        assert col.char_size is None
+        assert col.numeric_precision is None
+        assert col.numeric_scale is None
+        assert col.is_float() is False
+        assert col.is_number() is False
+        assert col.is_numeric() is False
+        assert col.is_string() is False
+        assert col.is_integer() is False
+        assert col.is_object() is True
+        assert col.is_array() is False
+        assert col.is_map() is False
+
+    def test_object_from_description_simple(self):
+        col = SnowflakeColumn.from_description("my_col", "OBJECT")
+        assert col.column == "my_col"
+        assert col.dtype == "OBJECT"
+        assert col.char_size is None
+        assert col.numeric_precision is None
+        assert col.numeric_scale is None
+        assert col.is_float() is False
+        assert col.is_number() is False
+        assert col.is_numeric() is False
+        assert col.is_string() is False
+        assert col.is_integer() is False
+        assert col.is_object() is True
+        assert col.is_array() is False
+        assert col.is_map() is False
+
+    def test_map_from_description(self):
+        col = SnowflakeColumn.from_description("my_col", "MAP(VARCHAR(2), VARCHAR(2))")
+        assert col.column == "my_col"
+        assert col.dtype == "MAP(VARCHAR(2), VARCHAR(2))"
+        assert col.char_size is None
+        assert col.numeric_precision is None
+        assert col.numeric_scale is None
+        assert col.is_float() is False
+        assert col.is_number() is False
+        assert col.is_numeric() is False
+        assert col.is_string() is False
+        assert col.is_integer() is False
+        assert col.is_map() is True
+        assert col.is_object() is False
+        assert col.is_array() is False
 
 
 class SnowflakeConnectionsTest(unittest.TestCase):

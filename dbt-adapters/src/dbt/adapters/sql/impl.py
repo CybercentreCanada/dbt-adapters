@@ -1,12 +1,14 @@
 from typing import Any, List, Optional, Tuple, Type, TYPE_CHECKING
 
 from dbt_common.events.functions import fire_event
+from dbt_common.record import record_function
 
 from dbt.adapters.base import BaseAdapter, BaseRelation, available
 from dbt.adapters.cache import _make_ref_key_dict
 from dbt.adapters.contracts.connection import AdapterResponse, Connection
 from dbt.adapters.events.types import ColTypeChange, SchemaCreation, SchemaDrop
 from dbt.adapters.exceptions import RelationTypeNullError
+from dbt.adapters.record.base import AdapterTestSqlRecord, AdapterAddQueryRecord
 from dbt.adapters.sql.connections import SQLConnectionManager
 
 LIST_RELATIONS_MACRO_NAME = "list_relations_without_caching"
@@ -47,6 +49,9 @@ class SQLAdapter(BaseAdapter):
     connections: SQLConnectionManager
 
     @available.parse(lambda *a, **k: (None, None))
+    @record_function(
+        AdapterAddQueryRecord, method=True, index_on_thread_id=True, id_field_name="thread_id"
+    )
     def add_query(
         self,
         sql: str,
@@ -255,6 +260,10 @@ class SQLAdapter(BaseAdapter):
         return adapter_response
 
     # This is for use in the test suite
+    @available
+    @record_function(
+        AdapterTestSqlRecord, method=True, index_on_thread_id=True, id_field_name="thread_id"
+    )
     def run_sql_for_tests(self, sql, fetch, conn):
         cursor = conn.handle.cursor()
         try:
