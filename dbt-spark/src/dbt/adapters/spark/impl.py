@@ -356,6 +356,7 @@ class SparkAdapter(SQLAdapter):
                 column=column["col_name"],
                 column_index=idx,
                 dtype=column["data_type"],
+                comment=column["comment"],
             )
             for idx, column in enumerate(rows)
         ]
@@ -658,6 +659,38 @@ class SparkAdapter(SQLAdapter):
         existing = TblPropertiesProcessor.from_relation_results(existing_table)
 
         return TblPropertiesProcessor.get_diff(desired, existing)
+
+    @available
+    def get_persist_doc_columns(
+        self, existing_columns: List[SparkColumn], columns: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Returns only columns whose comments differ from existing state.
+
+        Compares the desired description from model config against the current
+        column comment in the database, using case-insensitive column name matching.
+        Only columns that need an update are returned.
+        """
+        return_columns: Dict[str, Any] = {}
+
+        # Case-insensitive lookup: lower(model_col_name) -> original_model_col_name
+        columns_lower = {k.lower(): k for k in columns.keys()}
+
+        for column in existing_columns:
+            name = column.column
+            name_lower = name.lower()
+            if name_lower in columns_lower:
+                original_column_name = columns_lower[name_lower]
+                config_column = columns[original_column_name]
+                if isinstance(config_column, dict):
+                    comment = config_column.get("description", "")
+                elif hasattr(config_column, "description"):
+                    comment = config_column.description or ""
+                else:
+                    continue
+                if comment != (column.comment or ""):
+                    return_columns[name] = columns[original_column_name]
+
+        return return_columns
 
     @classmethod
     def _get_adapter_specific_run_info(cls, config: RelationConfig) -> Dict[str, Any]:
