@@ -69,6 +69,8 @@
     {% do apply_tblproperties(target_relation, config.get('tblproperties')) %}
   {%- else -%}
     {#-- Relation must be merged --#}
+    {% do adapter.check_partition_sync(target_relation, config.get('file_format'), config.get('partition_by')) %}
+    {% do sync_tblproperties(target_relation, config.get('tblproperties')) %}
     {%- call statement('create_tmp_relation', language=language) -%}
       {#-- CCCS --#}
       {{ create_table_as(use_temporary_view, tmp_relation, compiled_code, language) }}
@@ -77,8 +79,6 @@
     {%- call statement('main') -%}
       {{ dbt_spark_get_incremental_sql(strategy, tmp_relation, target_relation, existing_relation, unique_key, incremental_predicates) }}
     {%- endcall -%}
-    {% do adapter.check_partition_sync(target_relation, config.get('file_format'), config.get('partition_by')) %}
-    {% do sync_tblproperties(target_relation, config.get('tblproperties')) %}
     {#-- CCCS Add a check to see if a real table was created if so go ahead and delete this table. --#}
     {%- if language == 'python' and not use_temporary_view -%}
       {#--

@@ -18,8 +18,36 @@
 {%- endmacro %}
 
 
+{#-- Dispatch wrappers for cross-adapter compatibility --#}
 
-{% macro apply_tblproperties(relation, tblproperties) -%}
+{% macro apply_tblproperties(relation, tblproperties) %}
+  {{ return(adapter.dispatch('apply_tblproperties', 'dbt')(relation, tblproperties)) }}
+{% endmacro %}
+
+{% macro unset_tblproperties(relation, keys_to_unset) %}
+  {{ return(adapter.dispatch('unset_tblproperties', 'dbt')(relation, keys_to_unset)) }}
+{% endmacro %}
+
+{% macro sync_tblproperties(relation, tblproperties) %}
+  {{ return(adapter.dispatch('sync_tblproperties', 'dbt')(relation, tblproperties)) }}
+{% endmacro %}
+
+
+{#-- Default no-op implementations for adapters without tblproperties support --#}
+
+{% macro default__apply_tblproperties(relation, tblproperties) -%}
+{%- endmacro %}
+
+{% macro default__unset_tblproperties(relation, keys_to_unset) -%}
+{%- endmacro %}
+
+{% macro default__sync_tblproperties(relation, tblproperties) -%}
+{%- endmacro %}
+
+
+{#-- Spark implementations --#}
+
+{% macro spark__apply_tblproperties(relation, tblproperties) -%}
   {%- if config.get('file_format') != 'iceberg' -%}
     {{ return(none) }}
   {%- endif -%}
@@ -36,7 +64,7 @@
 {%- endmacro %}
 
 
-{% macro unset_tblproperties(relation, keys_to_unset) -%}
+{% macro spark__unset_tblproperties(relation, keys_to_unset) -%}
   {%- if config.get('file_format') != 'iceberg' -%}
     {{ return(none) }}
   {%- endif -%}
@@ -52,16 +80,24 @@
 {%- endmacro %}
 
 
-{% macro sync_tblproperties(relation, tblproperties) -%}
+{% macro spark__sync_tblproperties(relation, tblproperties) -%}
   {%- if config.get('file_format') != 'iceberg' -%}
     {{ return(none) }}
   {%- endif -%}
   {%- set diff = adapter.get_tblproperties_diff(relation, tblproperties) -%}
   {%- if diff is not none -%}
     {%- if diff.set_properties -%}
+      {{ log('Tblproperties drift on ' ~ relation ~ ': setting ' ~ diff.set_properties | list | join(', ')) }}
+      {%- for key, value in diff.set_properties.items() -%}
+        {{ log('  SET ' ~ key ~ ' = ' ~ value) }}
+      {%- endfor -%}
       {{ apply_tblproperties(relation, diff.set_properties) }}
     {%- endif -%}
     {%- if diff.unset_properties -%}
+      {{ log('Tblproperties drift on ' ~ relation ~ ': unsetting ' ~ diff.unset_properties | join(', ')) }}
+      {%- for key in diff.unset_properties -%}
+        {{ log('  UNSET ' ~ key) }}
+      {%- endfor -%}
       {{ unset_tblproperties(relation, diff.unset_properties) }}
     {%- endif -%}
   {%- endif -%}
