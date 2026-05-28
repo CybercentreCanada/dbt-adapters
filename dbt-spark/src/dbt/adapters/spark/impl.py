@@ -42,6 +42,31 @@ from dbt.adapters.spark.relation_configs.tblproperties import (
     TblPropertiesDiff,
     TblPropertiesProcessor,
 )
+from dbt.adapters.spark.relation_configs.partitions import (
+    PartitionConfig,
+    PartitionProcessor,
+)
+
+# Behavior flags for partition drift detection
+CHECK_PARTITION_SYNC = {
+    "name": "check_partition_sync",
+    "default": False,
+    "description": (
+        "When enabled, dbt will compare the model's partition_by config against the existing "
+        "Iceberg table partition spec on incremental runs. If they differ, a warning is logged "
+        "or an error is raised depending on the check_partition_sync_raises flag."
+    ),
+}
+
+CHECK_PARTITION_SYNC_RAISES = {
+    "name": "check_partition_sync_raises",
+    "default": False,
+    "description": (
+        "When enabled alongside check_partition_sync, dbt will raise an exception instead of "
+        "logging a warning when the model's partition_by config does not match the existing "
+        "Iceberg table partition spec."
+    ),
+}
 
 # CCCS
 from dbt.adapters.spark.python_submissions import (
@@ -150,6 +175,13 @@ class SparkAdapter(SQLAdapter):
     Column: TypeAlias = SparkColumn
     ConnectionManager: TypeAlias = SparkConnectionManager
     AdapterSpecificConfigs: TypeAlias = SparkConfig
+
+    @property
+    def _behavior_flags(self) -> List[Dict[str, Any]]:
+        return [
+            CHECK_PARTITION_SYNC,
+            CHECK_PARTITION_SYNC_RAISES,
+        ]
 
     @classmethod
     def date_function(cls) -> str:
@@ -691,6 +723,45 @@ class SparkAdapter(SQLAdapter):
                     return_columns[name] = columns[original_column_name]
 
         return return_columns
+
+    @available.parse(lambda *a, **k: None)
+    def check_partition_sync(
+        self, relation: BaseRelation, file_format: Optional[str], partition_by: Optional[object]
+    ) -> None:
+        """Check if the model's partition_by config matches the existing Iceberg table partitions.
+
+        Only runs if:
+        - The check_partition_sync behavior flag is enabled
+        - The file_format is 'iceberg'
+
+        If partitions are out of sync:
+        - Raises DbtRuntimeError if check_partition_sync_raises is True
+        - Logs a warning otherwise
+        """
+        if not self.behavior.check_partition_sync:
+            return
+
+        if file_format != "iceberg":
+            return
+
+        # Fetch existing partition spec from SHOW CREATE TABLE
+        show_create_result = self.execute_macro(
+            "fetch_partition_spec", kwargs={"relation": relation}
+        )
+        existing = PartitionProcessor.from_show_create_table(show_create_result)
+        desired = PartitionProcessor.from_model_config(partition_by)
+
+        if PartitionProcessor.is_out_of_sync(desired, existing):
+            diff_msg = PartitionProcessor.describe_diff(desired, existing)
+            message = (
+                f"Partition drift detected on {relation}.\n"
+                f"{diff_msg}\n"
+                f"The model's partition_by config does not match the existing table partition spec."
+            )
+            if self.behavior.check_partition_sync_raises:
+                raise DbtRuntimeError(message)
+            else:
+                logger.warning(message)
 
     @classmethod
     def _get_adapter_specific_run_info(cls, config: RelationConfig) -> Dict[str, Any]:
