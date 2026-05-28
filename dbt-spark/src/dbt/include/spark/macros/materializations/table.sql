@@ -120,7 +120,9 @@ else:
   msg = f"{type(df)} is not a supported type for dbt Python materialization"
   raise Exception(msg)
 
-{# CCCS, use DataFrameV2 for its support of tblproperties #}
+{# CCCS, use DataFrameV2 for its support of tblproperties.
+   Table properties are set at write time via DataFrameWriterV2.
+   Post-hoc SQL sync is handled separately for SQL materializations. #}
 if {{ temporary }}:
   df.createOrReplaceTempView("{{ target_relation }}")
 else:
@@ -169,10 +171,13 @@ else:
 {%- endmacro -%}
 
 {% macro python__tblproperties_clause() %}
-  {%- set tblproperties = config.get('tblproperties') -%}
-  {%- if tblproperties is not none %}
+  {%- if config.get('file_format') != 'iceberg' -%}
+    {{ return('') }}
+  {%- endif -%}
+  {%- set tblproperties = spark__filtered_tblproperties(config.get('tblproperties')) -%}
+  {%- if tblproperties is not none and tblproperties | length > 0 %}
       {% for prop in tblproperties %}
-  writer = writer.tableProperty("{{ prop }}", "{{ tblproperties[prop] }}")
+  writer = writer.tableProperty("{{ prop }}", "{{ spark__escape_single_quotes(tblproperties[prop]) }}")
       {%- endfor %}
   {%- endif %}
 {%- endmacro -%}

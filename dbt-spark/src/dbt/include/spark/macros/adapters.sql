@@ -3,11 +3,14 @@
 {%- endmacro -%}
 
 {% macro spark__tblproperties_clause() -%}
-  {%- set tblproperties = config.get('tblproperties') -%}
-  {%- if tblproperties is not none %}
+  {%- if config.get('file_format', validator=validation.any[basestring]) != 'iceberg' -%}
+    {{ return('') }}
+  {%- endif -%}
+  {%- set tblproperties = spark__filtered_tblproperties(config.get('tblproperties')) -%}
+  {%- if tblproperties is not none and tblproperties | length > 0 %}
     tblproperties (
       {%- for prop in tblproperties -%}
-      '{{ prop }}' = '{{ tblproperties[prop] }}' {% if not loop.last %}, {% endif %}
+      '{{ prop }}' = '{{ spark__escape_single_quotes(tblproperties[prop]) }}' {% if not loop.last %}, {% endif %}
       {%- endfor %}
     )
   {%- endif %}

@@ -55,6 +55,7 @@
       {{ create_table_as(False, target_relation, compiled_code, language) }}
     {%- endcall -%}
     {% do persist_constraints(target_relation, model) %}
+    {% do apply_tblproperties(target_relation, config.get('tblproperties')) %}
   {%- elif existing_relation.is_view or should_full_refresh() -%}
     {#-- Relation must be dropped & recreated --#}
     {% set is_delta = (file_format == 'delta' and existing_relation.is_delta) %}
@@ -65,6 +66,7 @@
       {{ create_table_as(False, target_relation, compiled_code, language) }}
     {%- endcall -%}
     {% do persist_constraints(target_relation, model) %}
+    {% do apply_tblproperties(target_relation, config.get('tblproperties')) %}
   {%- else -%}
     {#-- Relation must be merged --#}
     {%- call statement('create_tmp_relation', language=language) -%}
@@ -75,6 +77,7 @@
     {%- call statement('main') -%}
       {{ dbt_spark_get_incremental_sql(strategy, tmp_relation, target_relation, existing_relation, unique_key, incremental_predicates) }}
     {%- endcall -%}
+    {% do apply_tblproperties(target_relation, config.get('tblproperties')) %}
     {#-- CCCS Add a check to see if a real table was created if so go ahead and delete this table. --#}
     {%- if language == 'python' and not use_temporary_view -%}
       {#--
