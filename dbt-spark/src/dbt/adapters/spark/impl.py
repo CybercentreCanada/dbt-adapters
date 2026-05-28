@@ -66,6 +66,14 @@ DESCRIBE_TABLE_EXTENDED_MACRO_NAME = "describe_table_extended_without_caching"
 KEY_TABLE_OWNER = "Owner"
 KEY_TABLE_STATISTICS = "Statistics"
 
+SCHEMA_NOT_FOUND_MESSAGES = (
+    "[SCHEMA_NOT_FOUND]",
+    "Schema not found",
+    "Database not found",
+    "NoSuchNamespaceException",
+    "NoSuchDatabaseException",
+)
+
 TABLE_OR_VIEW_NOT_FOUND_MESSAGES = (
     "[TABLE_OR_VIEW_NOT_FOUND]",
     "Table or view not found",
@@ -282,7 +290,9 @@ class SparkAdapter(SQLAdapter):
             )
         except DbtRuntimeError as e:
             errmsg = getattr(e, "msg", "")
-            if f"Database '{schema_relation}' not found" in errmsg:
+            if any(msg in errmsg for msg in SCHEMA_NOT_FOUND_MESSAGES) or any(
+                msg in errmsg for msg in TABLE_OR_VIEW_NOT_FOUND_MESSAGES
+            ):
                 return []
             # Iceberg compute engine behavior: show table
             elif "SHOW TABLE EXTENDED is not supported for v2 tables" in errmsg:
@@ -304,10 +314,7 @@ class SparkAdapter(SQLAdapter):
                     logger.debug(f"{description} {schema_relation}: {e.msg}")
                     return []
             else:
-                logger.debug(
-                    f"Error while retrieving information about {schema_relation}: {errmsg}"
-                )
-                return []
+                raise
 
     def get_relation(self, database: str, schema: str, identifier: str) -> Optional[BaseRelation]:
         if not self.Relation.get_default_include_policy().database:
@@ -423,6 +430,17 @@ class SparkAdapter(SQLAdapter):
                 yield as_dict
         else:
             columns = self.parse_columns_from_information(relation)
+
+        if not columns:
+            # The DESCRIBE EXTENDED fallback path (e.g. Iceberg v2 tables) embeds
+            # column definitions in the information string as flat "col: type"
+            # lines, which INFORMATION_COLUMNS_REGEX does not match.  Fall back
+            # to querying the table schema directly via DESCRIBE EXTENDED.
+            try:
+                columns = self.get_columns_in_relation(relation)
+            except DbtRuntimeError as e:
+                logger.debug(f"Error retrieving columns for catalog entry {relation}: {e.msg}")
+                columns = []
 
         for column in columns:
             # convert SparkColumns into catalog dicts
