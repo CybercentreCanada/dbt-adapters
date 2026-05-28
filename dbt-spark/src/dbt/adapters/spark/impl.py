@@ -32,10 +32,16 @@ if TYPE_CHECKING:
 
 from dbt.adapters.base import AdapterConfig, PythonJobHelper
 from dbt.adapters.base.impl import catch_as_completed, ConstraintSupport
+from dbt.adapters.base.meta import available
 from dbt.adapters.sql import SQLAdapter
 from dbt.adapters.spark import SparkConnectionManager
 from dbt.adapters.spark import SparkRelation
 from dbt.adapters.spark import SparkColumn
+from dbt.adapters.spark.relation_configs.tblproperties import (
+    TblPropertiesConfig,
+    TblPropertiesDiff,
+    TblPropertiesProcessor,
+)
 
 # CCCS
 from dbt.adapters.spark.python_submissions import (
@@ -635,6 +641,23 @@ class SparkAdapter(SQLAdapter):
     def debug_query(self) -> None:
         """Override for DebugTask method"""
         self.execute("select 1 as id")
+
+    @available.parse(lambda *a, **k: None)
+    def get_tblproperties_diff(
+        self, relation: BaseRelation, desired_tblproperties: Optional[Dict[str, str]]
+    ) -> Optional[TblPropertiesDiff]:
+        """Compare desired tblproperties with existing ones and return a structured diff.
+
+        Returns None if no changes are needed.  The diff carries both properties to SET
+        and properties to UNSET so callers can issue the appropriate ALTER statements.
+        """
+        desired = TblPropertiesProcessor.from_relation_config(desired_tblproperties)
+
+        # Fetch existing properties from the server
+        existing_table = self.execute_macro("fetch_tbl_properties", kwargs={"relation": relation})
+        existing = TblPropertiesProcessor.from_relation_results(existing_table)
+
+        return TblPropertiesProcessor.get_diff(desired, existing)
 
     @classmethod
     def _get_adapter_specific_run_info(cls, config: RelationConfig) -> Dict[str, Any]:

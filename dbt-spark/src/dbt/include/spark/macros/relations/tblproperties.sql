@@ -34,3 +34,35 @@
     {%- endcall %}
   {%- endif -%}
 {%- endmacro %}
+
+
+{% macro unset_tblproperties(relation, keys_to_unset) -%}
+  {%- if config.get('file_format') != 'iceberg' -%}
+    {{ return(none) }}
+  {%- endif -%}
+  {%- if keys_to_unset is not none and keys_to_unset | length > 0 -%}
+    {% call statement() -%}
+      alter table {{ relation }} unset tblproperties if exists (
+        {%- for key in keys_to_unset -%}
+        '{{ key }}'{% if not loop.last %}, {% endif %}
+        {%- endfor -%}
+      )
+    {%- endcall %}
+  {%- endif -%}
+{%- endmacro %}
+
+
+{% macro sync_tblproperties(relation, tblproperties) -%}
+  {%- if config.get('file_format') != 'iceberg' -%}
+    {{ return(none) }}
+  {%- endif -%}
+  {%- set diff = adapter.get_tblproperties_diff(relation, tblproperties) -%}
+  {%- if diff is not none -%}
+    {%- if diff.set_properties -%}
+      {{ apply_tblproperties(relation, diff.set_properties) }}
+    {%- endif -%}
+    {%- if diff.unset_properties -%}
+      {{ unset_tblproperties(relation, diff.unset_properties) }}
+    {%- endif -%}
+  {%- endif -%}
+{%- endmacro %}
