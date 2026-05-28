@@ -156,6 +156,22 @@ models:
 
 If the existing table has a different partition spec (e.g., only `region`), dbt will warn or error with a message showing the mismatch.
 
+### V2 Relation Listing (Default)
+
+By default, dbt-spark now uses `SHOW TABLES` + `DESCRIBE EXTENDED` (v2) as the primary method for listing relations, which is compatible with Iceberg v2 tables. If v2 fails for a non-"not found" reason, it falls back to `SHOW TABLE EXTENDED` (v1) with a debug log.
+
+For legacy Spark catalogs that do not support the v2 path, you can revert to the original v1-first behavior using the `use_v1_relation_listing` behavior flag.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `use_v1_relation_listing` | `false` | Uses `SHOW TABLE EXTENDED` (v1) first, falling back to v2 on the "not supported for v2 tables" error |
+
+**Usage in `dbt_project.yml`:**
+```yaml
+flags:
+  use_v1_relation_listing: true  # revert to legacy v1-first listing
+```
+
 ## Contribute
 
 - Want to help us build `dbt-spark`? Check out the [Contributing Guide](CONTRIBUTING.md).

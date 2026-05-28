@@ -11,13 +11,20 @@ if TYPE_CHECKING:
     import agate
 
 
-# Properties managed by the system that should never be compared or synced.
+# CCCS prefixes for properties managed by the system that should never be compared or synced.
 IGNORE_PREFIXES = ("polaris_",)
+
+# CCCS exact property names that should also be ignored during comparison and sync.
+IGNORE_PROPERTIES: List[str] = [ "current-snapshot-id", "format", "format-version", "tblproperties"]
 
 
 def _filter_properties(props: Dict[str, str]) -> Dict[str, str]:
     """Remove system-managed properties from a dict."""
-    return {k: v for k, v in props.items() if not any(k.startswith(p) for p in IGNORE_PREFIXES)}
+    return {
+        k: v
+        for k, v in props.items()
+        if not any(k.startswith(p) for p in IGNORE_PREFIXES) and k not in IGNORE_PROPERTIES
+    }
 
 
 @dataclass(frozen=True)
@@ -68,7 +75,7 @@ class TblPropertiesProcessor:
             for row in results.rows:
                 key = str(row[0])
                 value = str(row[1])
-                if not any(key.startswith(p) for p in IGNORE_PREFIXES):
+                if not any(key.startswith(p) for p in IGNORE_PREFIXES) and key not in IGNORE_PROPERTIES:
                     tblproperties[key] = value
         return TblPropertiesConfig(tblproperties=tblproperties)
 

@@ -68,6 +68,17 @@ CHECK_PARTITION_SYNC_RAISES = {
     ),
 }
 
+# CCCS behavior flag to revert relation listing to legacy v1 (SHOW TABLE EXTENDED) order
+USE_V1_RELATION_LISTING = {
+    "name": "use_v1_relation_listing",
+    "default": False,
+    "description": (
+        "When enabled, dbt uses SHOW TABLE EXTENDED (v1) as the primary method for listing "
+        "relations instead of SHOW TABLES + DESCRIBE EXTENDED (v2). Use this for legacy Spark "
+        "catalogs that do not support v2 table listing."
+    ),
+}
+
 # CCCS
 from dbt.adapters.spark.python_submissions import (
     JobClusterPythonJobHelper,
@@ -176,11 +187,13 @@ class SparkAdapter(SQLAdapter):
     ConnectionManager: TypeAlias = SparkConnectionManager
     AdapterSpecificConfigs: TypeAlias = SparkConfig
 
+    # CCCS register all behavior flags for partition drift and relation listing order
     @property
     def _behavior_flags(self) -> List[Dict[str, Any]]:
         return [
             CHECK_PARTITION_SYNC,
             CHECK_PARTITION_SYNC_RAISES,
+            USE_V1_RELATION_LISTING,
         ]
 
     @classmethod
@@ -313,18 +326,37 @@ class SparkAdapter(SQLAdapter):
 
         return relations
 
+    # CCCS dispatches relation listing to v2-first (default) or v1-first based on behavior flag
     def list_relations_without_caching(self, schema_relation: BaseRelation) -> List[BaseRelation]:
         """Distinct Spark compute engines may not support the same SQL featureset. Thus, we must
-        try different methods to fetch relation information."""
+        try different methods to fetch relation information.
+
+        By default (use_v1_relation_listing=False), uses SHOW TABLES + DESCRIBE EXTENDED (v2)
+        which works with Iceberg v2 tables. Falls back to SHOW TABLE EXTENDED (v1) on failure.
+
+        When use_v1_relation_listing is enabled, uses SHOW TABLE EXTENDED (v1) first and falls
+        back to v2 when encountering the 'not supported for v2 tables' error.
+        """
 
         kwargs = {"schema_relation": schema_relation}
+
+        if self.behavior.use_v1_relation_listing:
+            return self._list_relations_v1_first(kwargs, schema_relation)
+        else:
+            return self._list_relations_v2_first(kwargs, schema_relation)
+
+    # CCCS v2-first: uses SHOW TABLES + DESCRIBE EXTENDED, falls back to SHOW TABLE EXTENDED
+    def _list_relations_v2_first(
+        self, kwargs: Dict[str, Any], schema_relation: BaseRelation
+    ) -> List[BaseRelation]:
+        """SHOW TABLES + DESCRIBE EXTENDED (v2) first, SHOW TABLE EXTENDED (v1) fallback."""
         try:
-            # Default compute engine behavior: show tables extended
-            show_table_extended_rows = self.execute_macro(LIST_RELATIONS_MACRO_NAME, kwargs=kwargs)
+            show_table_rows = self.execute_macro(
+                LIST_RELATIONS_SHOW_TABLES_MACRO_NAME, kwargs=kwargs
+            )
             return self._build_spark_relation_list(
-                row_list=show_table_extended_rows,
-                relation_info_func=self._get_relation_information,
-                # CCCS pass BaseRelation to get destination database
+                row_list=show_table_rows,
+                relation_info_func=self._get_relation_information_using_describe,
                 schema_relation=schema_relation,
             )
         except DbtRuntimeError as e:
@@ -333,7 +365,50 @@ class SparkAdapter(SQLAdapter):
                 msg in errmsg for msg in TABLE_OR_VIEW_NOT_FOUND_MESSAGES
             ):
                 return []
-            # Iceberg compute engine behavior: show table
+            logger.debug(
+                f"v2 relation listing failed for {schema_relation}, "
+                f"falling back to SHOW TABLE EXTENDED: {errmsg}"
+            )
+
+        # Fallback to v1: SHOW TABLE EXTENDED
+        try:
+            show_table_extended_rows = self.execute_macro(
+                LIST_RELATIONS_MACRO_NAME, kwargs=kwargs
+            )
+            return self._build_spark_relation_list(
+                row_list=show_table_extended_rows,
+                relation_info_func=self._get_relation_information,
+                schema_relation=schema_relation,
+            )
+        except DbtRuntimeError as e:
+            errmsg = getattr(e, "msg", "")
+            if any(msg in errmsg for msg in SCHEMA_NOT_FOUND_MESSAGES) or any(
+                msg in errmsg for msg in TABLE_OR_VIEW_NOT_FOUND_MESSAGES
+            ):
+                return []
+            raise
+
+    # CCCS v1-first: uses SHOW TABLE EXTENDED, falls back to v2 on 'not supported for v2 tables'
+    def _list_relations_v1_first(
+        self, kwargs: Dict[str, Any], schema_relation: BaseRelation
+    ) -> List[BaseRelation]:
+        """SHOW TABLE EXTENDED (v1) first, SHOW TABLES + DESCRIBE EXTENDED (v2) fallback."""
+        try:
+            show_table_extended_rows = self.execute_macro(
+                LIST_RELATIONS_MACRO_NAME, kwargs=kwargs
+            )
+            return self._build_spark_relation_list(
+                row_list=show_table_extended_rows,
+                relation_info_func=self._get_relation_information,
+                schema_relation=schema_relation,
+            )
+        except DbtRuntimeError as e:
+            errmsg = getattr(e, "msg", "")
+            if any(msg in errmsg for msg in SCHEMA_NOT_FOUND_MESSAGES) or any(
+                msg in errmsg for msg in TABLE_OR_VIEW_NOT_FOUND_MESSAGES
+            ):
+                return []
+            # Iceberg v2 tables: https://issues.apache.org/jira/browse/SPARK-33393
             elif "SHOW TABLE EXTENDED is not supported for v2 tables" in errmsg:
                 # this happens with spark-iceberg with v2 iceberg tables
                 # https://issues.apache.org/jira/browse/SPARK-33393
@@ -345,7 +420,7 @@ class SparkAdapter(SQLAdapter):
                     return self._build_spark_relation_list(
                         row_list=show_table_rows,
                         relation_info_func=self._get_relation_information_using_describe,
-                        # CCCS pass BaseRelation to get destination database
+                         # CCCS pass BaseRelation to get destination database
                         schema_relation=schema_relation,
                     )
                 except DbtRuntimeError as e:
