@@ -84,6 +84,29 @@ rm -rf ./.hive-metastore/
 rm -rf ./.spark-warehouse/
 ```
 
+## Running Integration Tests
+
+To run the integration tests via Dagger (containerized Spark + Postgres metastore):
+
+```sh
+cd dbt-spark
+hatch run setup
+hatch run integration-tests
+```
+
+If your environment uses custom or corporate root certificates (e.g., behind a
+proxy or on a government network), export the following before running:
+
+```sh
+export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+export REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+export PIP_CERT=/etc/ssl/certs/ca-certificates.crt
+hatch run integration-tests
+```
+
+This ensures pip, git+https fetches, and Python HTTP clients use the system
+trust store instead of the bundled `certifi` CA bundle.
+
 ## Additional Configuration for ODBC
 
 The ODBC connection method (and the unit test suite, which exercises the ODBC
