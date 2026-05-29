@@ -76,14 +76,22 @@
     {#-- insert statements don't like CTEs, so support them via a temp view #}
     {{ get_insert_overwrite_sql(source, target, existing) }}
   {%- elif strategy == 'microbatch' -%}
-    {#-- microbatch wraps insert_overwrite, and requires a partition_by config #}
+    {#-- microbatch wraps insert_overwrite on Iceberg, and requires a partition_by config #}
     {% set missing_partition_key_microbatch_msg -%}
       dbt-spark 'microbatch' incremental strategy requires a `partition_by` config.
       Ensure you are using a `partition_by` column that is of grain {{ config.get('batch_size') }}.
     {%- endset %}
 
+    {% set invalid_microbatch_file_format_msg -%}
+      dbt-spark 'microbatch' incremental strategy is only supported when file_format is 'iceberg'.
+      Got file_format='{{ config.get('file_format', default='parquet') }}'.
+    {%- endset %}
+
     {%- if not config.get('partition_by') -%}
       {{ exceptions.raise_compiler_error(missing_partition_key_microbatch_msg) }}
+    {%- endif -%}
+    {%- if config.get('file_format', default='parquet') != 'iceberg' -%}
+      {{ exceptions.raise_compiler_error(invalid_microbatch_file_format_msg) }}
     {%- endif -%}
     {{ get_insert_overwrite_sql(source, target, existing) }}
   {%- elif strategy == 'merge' -%}

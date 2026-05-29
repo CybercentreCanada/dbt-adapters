@@ -178,7 +178,18 @@ class SparkAdapter(SQLAdapter):
 
     # CCCS
     _capabilities = CapabilityDict(
-        {Capability.SchemaMetadataByRelations: CapabilitySupport(support=Support.Full)}
+        {
+            Capability.SchemaMetadataByRelations: CapabilitySupport(support=Support.Full),
+            # Microbatch batches can run concurrently because:
+            #   1. Each batch gets a unique tmp relation suffixed with model.batch.id
+            #      (see macros/materializations/incremental/incremental.sql).
+            #   2. Microbatch is gated to file_format='iceberg', whose snapshot-isolated
+            #      INSERT OVERWRITE is safe for concurrent writers to disjoint partitions.
+            #   3. The session-level partitionOverwriteMode SET is skipped on the Iceberg
+            #      path (Iceberg ignores it and Spark 3.5.6 cannot co-locate the SET with
+            #      the INSERT in a single submission).
+            Capability.MicrobatchConcurrency: CapabilitySupport(support=Support.Full),
+        }
     )
 
     Relation: TypeAlias = SparkRelation

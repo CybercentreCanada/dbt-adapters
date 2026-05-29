@@ -16,7 +16,21 @@
   {%- set incremental_predicates = config.get('predicates', none) or config.get('incremental_predicates', none) -%}
   {%- set target_relation = this -%}
   {%- set existing_relation = load_relation(this) -%}
-  {% set tmp_relation = this.incorporate(path = {"identifier": this.identifier ~ '__dbt_tmp'}) -%}
+
+  {#--
+    Build the tmp relation identifier with a per-batch suffix so concurrent
+    microbatch batches do not clobber each other's temp relations.
+    Mirrors the convention used by the base `make_temp_relation` macro at
+    dbt-adapters/src/dbt/include/global_project/macros/adapters/relation.sql
+    so that `model.batch.id` is appended when running inside a microbatch batch.
+  --#}
+  {%- set tmp_relation_suffix = '__dbt_tmp' -%}
+  {%- if model.batch -%}
+    {%- set tmp_relation_suffix = tmp_relation_suffix ~ '_' ~ model.batch.id -%}
+  {%- endif -%}
+  {% set tmp_relation = this.incorporate(path = {"identifier": this.identifier ~ tmp_relation_suffix}) -%}
+  {#-- User hook for redirecting the tmp relation (e.g., to a scratch schema). --#}
+  {%- set tmp_relation = spark_resolve_incremental_tmp_relation(tmp_relation) -%}
 
   {#-- CCCS --#}
   {%- set use_temporary_view = True -%}
@@ -38,8 +52,17 @@
     {%- endif -%}
   {%- endif -%}
 
-  {#-- Set Overwrite Mode --#}
-  {%- if strategy in ['insert_overwrite', 'microbatch'] and partition_by -%}
+  {#--
+    Set Overwrite Mode.
+    For Iceberg, the `spark.sql.sources.partitionOverwriteMode` flag has no
+    effect (Iceberg's INSERT OVERWRITE uses native dynamic-partition
+    semantics via the Iceberg SQL extensions). Skipping the SET on the
+    Iceberg path also removes a session-level race condition that would
+    otherwise block safe parallel microbatch execution, because Spark 3.5.6
+    does not support multi-statement submissions and the SET cannot be
+    co-located with the INSERT.
+  --#}
+  {%- if strategy == 'insert_overwrite' and partition_by and file_format != 'iceberg' -%}
     {%- call statement() -%}
       set spark.sql.sources.partitionOverwriteMode = DYNAMIC
     {%- endcall -%}
@@ -69,8 +92,16 @@
     {% do apply_tblproperties(target_relation, config.get('tblproperties')) %}
   {%- else -%}
     {#-- Relation must be merged --#}
-    {% do adapter.check_partition_sync(target_relation, config.get('file_format'), config.get('partition_by')) %}
-    {% do sync_tblproperties(target_relation, config.get('tblproperties')) %}
+    {#--
+      Per-batch metadata mutations (`check_partition_sync` / `sync_tblproperties`)
+      race under concurrent microbatch execution and are unnecessary on
+      subsequent batches (the target already exists with the right schema/
+      properties). Only run on non-microbatch executions or the first batch.
+    --#}
+    {%- if not model.batch -%}
+      {% do adapter.check_partition_sync(target_relation, config.get('file_format'), config.get('partition_by')) %}
+      {% do sync_tblproperties(target_relation, config.get('tblproperties')) %}
+    {%- endif -%}
     {%- call statement('create_tmp_relation', language=language) -%}
       {#-- CCCS --#}
       {{ create_table_as(use_temporary_view, tmp_relation, compiled_code, language) }}
@@ -104,3 +135,22 @@
   {{ return({'relations': [target_relation]}) }}
 
 {%- endmaterialization %}
+
+
+{#--
+  User-overridable hook for redirecting the incremental tmp relation
+  (for example, to a scratch schema) so that concurrent microbatch
+  batches writing into the same target schema do not collide on
+  ancillary metadata. Mirrors `snowflake__resolve_incremental_tmp_relation`.
+--#}
+{% macro spark_resolve_incremental_tmp_relation(tmp_relation) %}
+  {{ return(adapter.dispatch('spark_resolve_incremental_tmp_relation', 'dbt')(tmp_relation)) }}
+{% endmacro %}
+
+{% macro default__spark_resolve_incremental_tmp_relation(tmp_relation) %}
+  {{ return(tmp_relation) }}
+{% endmacro %}
+
+{% macro spark__spark_resolve_incremental_tmp_relation(tmp_relation) %}
+  {{ return(tmp_relation) }}
+{% endmacro %}
