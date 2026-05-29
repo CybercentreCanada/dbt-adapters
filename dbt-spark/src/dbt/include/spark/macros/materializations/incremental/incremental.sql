@@ -54,15 +54,14 @@
 
   {#--
     Set Overwrite Mode.
-    For Iceberg, the `spark.sql.sources.partitionOverwriteMode` flag has no
-    effect (Iceberg's INSERT OVERWRITE uses native dynamic-partition
-    semantics via the Iceberg SQL extensions). Skipping the SET on the
-    Iceberg path also removes a session-level race condition that would
-    otherwise block safe parallel microbatch execution, because Spark 3.5.6
-    does not support multi-statement submissions and the SET cannot be
-    co-located with the INSERT.
+    Controlled by the `set_partition_overwrite_mode` behavior flag (default: true).
+    On Iceberg this is a no-op (Iceberg's INSERT OVERWRITE uses native
+    dynamic-partition semantics via the Iceberg SQL extensions), but we emit
+    it defensively so the session is always in the expected state.
+    For non-Iceberg formats (parquet, delta, hive, etc.) this SET is required
+    for correct dynamic partition overwrite behavior.
   --#}
-  {%- if strategy == 'insert_overwrite' and partition_by and file_format != 'iceberg' -%}
+  {%- if strategy in ('insert_overwrite', 'microbatch') and partition_by and adapter.behavior.set_partition_overwrite_mode -%}
     {%- call statement() -%}
       set spark.sql.sources.partitionOverwriteMode = DYNAMIC
     {%- endcall -%}

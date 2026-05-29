@@ -1,6 +1,4 @@
 kind: Features
-body: Add `require_location_root` behavior flag (default true) that raises a compiler
-  error when a table materialization does not specify `location_root`. This ensures
-  all tables are created at explicit storage locations. Disable with
-  `require_location_root: false` in dbt_project.yml flags.
+body: |
+  Add `require_location_root` behavior flag (default true) that raises a compiler error when a table materialization does not specify `location_root`. This ensures all tables are created at explicit storage locations. Disable with `require_location_root: false` in dbt_project.yml flags.
 time: 2026-05-29T00:00:03.000000-08:00

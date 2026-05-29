@@ -46,9 +46,7 @@ class TestTblPropertiesProcessor:
         assert config.tblproperties == {}
 
     def test_from_relation_config_filters_polaris(self):
-        config = TblPropertiesProcessor.from_relation_config(
-            {"a": "1", "polaris_managed": "true"}
-        )
+        config = TblPropertiesProcessor.from_relation_config({"a": "1", "polaris_managed": "true"})
         assert config.tblproperties == {"a": "1"}
 
     def test_from_relation_results_empty(self):

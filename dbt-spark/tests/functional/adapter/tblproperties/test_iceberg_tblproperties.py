@@ -73,9 +73,7 @@ select 1 as id
 def _get_tblproperties(project, model_name):
     """Fetch tblproperties from the catalog for a given model."""
     relation = relation_from_name(project.adapter, model_name)
-    _, result = project.adapter.execute(
-        f"SHOW TBLPROPERTIES {relation}", fetch=True
-    )
+    _, result = project.adapter.execute(f"SHOW TBLPROPERTIES {relation}", fetch=True)
     props = {}
     for row in result.rows:
         props[str(row[0])] = str(row[1])

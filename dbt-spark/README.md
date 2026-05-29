@@ -198,16 +198,16 @@ If the existing table has a different partition spec (e.g., only `region`), dbt 
 
 By default, dbt-spark now uses `SHOW TABLES` + `DESCRIBE EXTENDED` (v2) as the primary method for listing relations, which is compatible with Iceberg v2 tables. If v2 fails for a non-"not found" reason, it falls back to `SHOW TABLE EXTENDED` (v1) with a debug log.
 
-For legacy Spark catalogs that do not support the v2 path, you can revert to the original v1-first behavior using the `use_v1_relation_listing` behavior flag.
+For legacy Spark catalogs that do not support the v2 path, you can disable v2 relation listing using the `use_v2_relation_listing` behavior flag.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `use_v1_relation_listing` | `false` | Uses `SHOW TABLE EXTENDED` (v1) first, falling back to v2 on the "not supported for v2 tables" error |
+| `use_v2_relation_listing` | `true` | Uses `SHOW TABLES` + `DESCRIBE EXTENDED` (v2) first, falling back to v1 on failure. Set to `false` to revert to legacy v1-first listing. |
 
 **Usage in `dbt_project.yml`:**
 ```yaml
 flags:
-  use_v1_relation_listing: true  # revert to legacy v1-first listing
+  use_v2_relation_listing: false  # revert to legacy v1-first listing
 ```
 
 ### Required Location Root (Default)
@@ -224,6 +224,22 @@ To disable this check (e.g., for managed tables where Spark controls the storage
 ```yaml
 flags:
   require_location_root: false  # allow tables without explicit location
+```
+
+### Partition Overwrite Mode SET (Default)
+
+By default, dbt-spark emits `SET spark.sql.sources.partitionOverwriteMode = DYNAMIC` before `insert_overwrite` and `microbatch` operations that use `partition_by`. On Iceberg this is a no-op (Iceberg handles dynamic overwrite natively via its SQL extensions), but it serves as a defensive measure ensuring the session is in the expected state. For non-Iceberg formats (parquet, delta, hive, etc.) this SET is required for correct dynamic partition overwrite behavior.
+
+To disable the SET (e.g., if the session-level statement causes issues in your environment), set `set_partition_overwrite_mode` to `false`.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `set_partition_overwrite_mode` | `true` | Emits `SET spark.sql.sources.partitionOverwriteMode = DYNAMIC` before insert_overwrite/microbatch with partition_by |
+
+**Usage in `dbt_project.yml`:**
+```yaml
+flags:
+  set_partition_overwrite_mode: false  # skip the session SET
 ```
 
 **Model config:**
@@ -268,13 +284,11 @@ models:
    suffixed with `model.batch.id` (e.g. `events__dbt_tmp_20240115`) so
    concurrent batches do not clobber each other's temp objects. Mirrors the
    pattern in `dbt-adapters`'s base `make_temp_relation`.
-2. **No `partitionOverwriteMode` SET on the Iceberg path.** Iceberg's
-   `INSERT OVERWRITE` uses native dynamic-partition semantics via the Iceberg
-   SQL extensions and ignores `spark.sql.sources.partitionOverwriteMode`. The
-   session-level SET is therefore skipped, which also removes a race that
-   would otherwise be unavoidable: Apache Spark 3.5.6 cannot submit
-   multi-statement SQL, so the SET cannot be co-located with the INSERT in a
-   single submission.
+2. **`partitionOverwriteMode` SET is controlled by the `set_partition_overwrite_mode` flag.**
+   The SET is emitted by default (flag defaults to `true`). On Iceberg this is
+   a no-op since Iceberg's `INSERT OVERWRITE` uses native dynamic-partition
+   semantics via the Iceberg SQL extensions. The flag can be disabled if the
+   session-level SET causes issues in your environment.
 3. **Per-batch metadata sync is suppressed under concurrency.**
    `check_partition_sync` and `sync_tblproperties` mutate table-level
    metadata and cannot safely run from multiple workers at once. They are

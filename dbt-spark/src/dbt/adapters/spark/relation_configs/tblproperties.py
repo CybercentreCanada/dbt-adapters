@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 IGNORE_PREFIXES = ("polaris_",)
 
 # CCCS exact property names that should also be ignored during comparison and sync.
-IGNORE_PROPERTIES: List[str] = [ "current-snapshot-id", "format", "format-version", "tblproperties"]
+IGNORE_PROPERTIES: List[str] = ["current-snapshot-id", "format", "format-version", "tblproperties"]
 
 
 def _filter_properties(props: Dict[str, str]) -> Dict[str, str]:
@@ -75,7 +75,10 @@ class TblPropertiesProcessor:
             for row in results.rows:
                 key = str(row[0])
                 value = str(row[1])
-                if not any(key.startswith(p) for p in IGNORE_PREFIXES) and key not in IGNORE_PROPERTIES:
+                if (
+                    not any(key.startswith(p) for p in IGNORE_PREFIXES)
+                    and key not in IGNORE_PROPERTIES
+                ):
                     tblproperties[key] = value
         return TblPropertiesConfig(tblproperties=tblproperties)
 
@@ -110,13 +113,9 @@ class TblPropertiesProcessor:
                 set_properties[k] = v
 
         # Properties to unset: keys present in existing but absent in desired
-        unset_properties: List[str] = [
-            k for k in existing_filtered if k not in desired_filtered
-        ]
+        unset_properties: List[str] = [k for k in existing_filtered if k not in desired_filtered]
 
-        diff = TblPropertiesDiff(
-            set_properties=set_properties, unset_properties=unset_properties
-        )
+        diff = TblPropertiesDiff(set_properties=set_properties, unset_properties=unset_properties)
         if diff.has_changes:
             return diff
         return None

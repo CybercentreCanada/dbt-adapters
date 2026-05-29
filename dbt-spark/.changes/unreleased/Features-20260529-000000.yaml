@@ -1,12 +1,6 @@
 kind: Features
-body: Support `Capability.MicrobatchConcurrency` for Iceberg-backed microbatch incremental
-  models. Per-batch tmp relations are suffixed with `model.batch.id` to avoid collisions,
-  the `partitionOverwriteMode` session SET is skipped on the Iceberg path (Iceberg
-  ignores it and Spark 3.5.6 cannot co-locate the SET with the INSERT), and per-batch
-  metadata sync (`check_partition_sync` / `sync_tblproperties`) is skipped only when
-  dbt-core may schedule batches concurrently — it still runs when the model sets
-  `concurrent_batches: false`. The `microbatch` strategy now requires
-  `file_format='iceberg'` and raises a clear compiler error otherwise.
+body: |
+  Support `Capability.MicrobatchConcurrency` for Iceberg-backed microbatch incremental models. Per-batch tmp relations are suffixed with `model.batch.id` to avoid collisions, the `partitionOverwriteMode` session SET is skipped on the Iceberg path (Iceberg ignores it and Spark 3.5.6 cannot co-locate the SET with the INSERT), and per-batch metadata sync (`check_partition_sync` / `sync_tblproperties`) is skipped only when dbt-core may schedule batches concurrently — it still runs when the model sets `concurrent_batches: false`. The `microbatch` strategy now requires `file_format='iceberg'` and raises a clear compiler error otherwise.
 time: 2026-05-29T00:00:00.000000-08:00
 custom:
   Author: cccs

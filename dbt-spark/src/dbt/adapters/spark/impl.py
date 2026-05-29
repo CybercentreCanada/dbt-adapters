@@ -38,14 +38,22 @@ from dbt.adapters.spark import SparkConnectionManager
 from dbt.adapters.spark import SparkRelation
 from dbt.adapters.spark import SparkColumn
 from dbt.adapters.spark.relation_configs.tblproperties import (
-    TblPropertiesConfig,
     TblPropertiesDiff,
     TblPropertiesProcessor,
 )
 from dbt.adapters.spark.relation_configs.partitions import (
-    PartitionConfig,
     PartitionProcessor,
 )
+from dbt.adapters.spark.python_submissions import (
+    JobClusterPythonJobHelper,
+    AllPurposeClusterPythonJobHelper,
+    SparkSessionBasedClusterPythonJobHelper,
+)
+from dbt.adapters.capability import CapabilityDict, CapabilitySupport, Support, Capability
+from dbt.adapters.base import BaseRelation
+from dbt.adapters.contracts.relation import RelationType, RelationConfig
+from dbt_common.clients.agate_helper import DEFAULT_TYPE_TESTER
+from dbt_common.contracts.constraints import ConstraintType
 
 # Behavior flags for partition drift detection
 CHECK_PARTITION_SYNC = {
@@ -68,14 +76,27 @@ CHECK_PARTITION_SYNC_RAISES = {
     ),
 }
 
-# CCCS behavior flag to revert relation listing to legacy v1 (SHOW TABLE EXTENDED) order
-USE_V1_RELATION_LISTING = {
-    "name": "use_v1_relation_listing",
-    "default": False,
+# CCCS behavior flag to use v2 relation listing (SHOW TABLES + DESCRIBE EXTENDED)
+USE_V2_RELATION_LISTING = {
+    "name": "use_v2_relation_listing",
+    "default": True,
     "description": (
-        "When enabled, dbt uses SHOW TABLE EXTENDED (v1) as the primary method for listing "
-        "relations instead of SHOW TABLES + DESCRIBE EXTENDED (v2). Use this for legacy Spark "
-        "catalogs that do not support v2 table listing."
+        "When enabled, dbt uses SHOW TABLES + DESCRIBE EXTENDED (v2) as the primary method "
+        "for listing relations, which is compatible with Iceberg v2 tables. Falls back to "
+        "SHOW TABLE EXTENDED (v1) on failure. Disable for legacy Spark catalogs that do not "
+        "support v2 table listing."
+    ),
+}
+
+# CCCS behavior flag to control SET spark.sql.sources.partitionOverwriteMode = DYNAMIC
+SET_PARTITION_OVERWRITE_MODE = {
+    "name": "set_partition_overwrite_mode",
+    "default": True,
+    "description": (
+        "When enabled, dbt emits `SET spark.sql.sources.partitionOverwriteMode = DYNAMIC` "
+        "before insert_overwrite and microbatch operations that use partition_by. On Iceberg "
+        "this is a no-op (Iceberg handles dynamic overwrite natively), but it serves as a "
+        "defensive measure. Disable if the session-level SET causes issues in your environment."
     ),
 }
 
@@ -89,19 +110,6 @@ REQUIRE_LOCATION_ROOT = {
         "storage locations."
     ),
 }
-
-# CCCS
-from dbt.adapters.spark.python_submissions import (
-    JobClusterPythonJobHelper,
-    AllPurposeClusterPythonJobHelper,
-    SparkSessionBasedClusterPythonJobHelper,
-)
-from dbt.adapters.capability import CapabilityDict, CapabilitySupport, Support, Capability
-
-from dbt.adapters.base import BaseRelation
-from dbt.adapters.contracts.relation import RelationType, RelationConfig
-from dbt_common.clients.agate_helper import DEFAULT_TYPE_TESTER
-from dbt_common.contracts.constraints import ConstraintType
 
 logger = AdapterLogger("Spark")
 packages = ["pyhive.hive", "thrift.transport", "thrift.protocol"]
@@ -196,9 +204,8 @@ class SparkAdapter(SQLAdapter):
             #      (see macros/materializations/incremental/incremental.sql).
             #   2. Microbatch is gated to file_format='iceberg', whose snapshot-isolated
             #      INSERT OVERWRITE is safe for concurrent writers to disjoint partitions.
-            #   3. The session-level partitionOverwriteMode SET is skipped on the Iceberg
-            #      path (Iceberg ignores it and Spark 3.5.6 cannot co-locate the SET with
-            #      the INSERT in a single submission).
+            #   3. The partitionOverwriteMode SET is controlled by the
+            #      set_partition_overwrite_mode behavior flag; on Iceberg it is a no-op.
             Capability.MicrobatchConcurrency: CapabilitySupport(support=Support.Full),
         }
     )
@@ -215,7 +222,8 @@ class SparkAdapter(SQLAdapter):
         return [
             CHECK_PARTITION_SYNC,
             CHECK_PARTITION_SYNC_RAISES,
-            USE_V1_RELATION_LISTING,
+            USE_V2_RELATION_LISTING,
+            SET_PARTITION_OVERWRITE_MODE,
             REQUIRE_LOCATION_ROOT,
         ]
 
@@ -254,7 +262,9 @@ class SparkAdapter(SQLAdapter):
         return "`{}`".format(identifier)
 
     # CCCS schema_relation added to the method signature
-    def _get_relation_information(self, row: "agate.Row", schema_relation: BaseRelation) -> RelationInfo:
+    def _get_relation_information(
+        self, row: "agate.Row", schema_relation: BaseRelation
+    ) -> RelationInfo:
         """relation info was fetched with SHOW TABLES EXTENDED"""
         try:
             _schema, name, _, information = row
@@ -266,7 +276,9 @@ class SparkAdapter(SQLAdapter):
         return _schema, name, information
 
     # CCCS schema_relation added to get the database
-    def _get_relation_information_using_describe(self, row: "agate.Row", schema_relation: BaseRelation) -> RelationInfo:
+    def _get_relation_information_using_describe(
+        self, row: "agate.Row", schema_relation: BaseRelation
+    ) -> RelationInfo:
         """Relation info fetched using SHOW TABLES and an auxiliary DESCRIBE statement"""
         try:
             _schema, name, _ = row
@@ -354,19 +366,19 @@ class SparkAdapter(SQLAdapter):
         """Distinct Spark compute engines may not support the same SQL featureset. Thus, we must
         try different methods to fetch relation information.
 
-        By default (use_v1_relation_listing=False), uses SHOW TABLES + DESCRIBE EXTENDED (v2)
+        By default (use_v2_relation_listing=True), uses SHOW TABLES + DESCRIBE EXTENDED (v2)
         which works with Iceberg v2 tables. Falls back to SHOW TABLE EXTENDED (v1) on failure.
 
-        When use_v1_relation_listing is enabled, uses SHOW TABLE EXTENDED (v1) first and falls
+        When use_v2_relation_listing is disabled, uses SHOW TABLE EXTENDED (v1) first and falls
         back to v2 when encountering the 'not supported for v2 tables' error.
         """
 
         kwargs = {"schema_relation": schema_relation}
 
-        if self.behavior.use_v1_relation_listing:
-            return self._list_relations_v1_first(kwargs, schema_relation)
-        else:
+        if self.behavior.use_v2_relation_listing:
             return self._list_relations_v2_first(kwargs, schema_relation)
+        else:
+            return self._list_relations_v1_first(kwargs, schema_relation)
 
     # CCCS v2-first: uses SHOW TABLES + DESCRIBE EXTENDED, falls back to SHOW TABLE EXTENDED
     def _list_relations_v2_first(
@@ -395,9 +407,7 @@ class SparkAdapter(SQLAdapter):
 
         # Fallback to v1: SHOW TABLE EXTENDED
         try:
-            show_table_extended_rows = self.execute_macro(
-                LIST_RELATIONS_MACRO_NAME, kwargs=kwargs
-            )
+            show_table_extended_rows = self.execute_macro(LIST_RELATIONS_MACRO_NAME, kwargs=kwargs)
             return self._build_spark_relation_list(
                 row_list=show_table_extended_rows,
                 relation_info_func=self._get_relation_information,
@@ -417,9 +427,7 @@ class SparkAdapter(SQLAdapter):
     ) -> List[BaseRelation]:
         """SHOW TABLE EXTENDED (v1) first, SHOW TABLES + DESCRIBE EXTENDED (v2) fallback."""
         try:
-            show_table_extended_rows = self.execute_macro(
-                LIST_RELATIONS_MACRO_NAME, kwargs=kwargs
-            )
+            show_table_extended_rows = self.execute_macro(LIST_RELATIONS_MACRO_NAME, kwargs=kwargs)
             return self._build_spark_relation_list(
                 row_list=show_table_extended_rows,
                 relation_info_func=self._get_relation_information,
@@ -443,7 +451,7 @@ class SparkAdapter(SQLAdapter):
                     return self._build_spark_relation_list(
                         row_list=show_table_rows,
                         relation_info_func=self._get_relation_information_using_describe,
-                         # CCCS pass BaseRelation to get destination database
+                        # CCCS pass BaseRelation to get destination database
                         schema_relation=schema_relation,
                     )
                 except DbtRuntimeError as e:
@@ -664,7 +672,7 @@ class SparkAdapter(SQLAdapter):
                 database=relation.database,
                 schema=relation.schema,
                 identifier=relation.identifier,
-                type=RelationType.Table,
+                type=RelationType.Table,  # type: ignore[arg-type]
                 information=relation.information,
                 is_delta=False,
                 is_iceberg=True,
