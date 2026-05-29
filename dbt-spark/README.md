@@ -84,12 +84,27 @@ rm -rf ./.hive-metastore/
 rm -rf ./.spark-warehouse/
 ```
 
-## Additional Configuration for MacOS
+## Additional Configuration for ODBC
 
-If installing on MacOS, use `homebrew` to install required dependencies.
-   ```sh
-   brew install unixodbc
-   ```
+The ODBC connection method (and the unit test suite, which exercises the ODBC
+profile fixture) requires the `unixODBC` system library (`libodbc.so.2`) in
+addition to the `dbt-spark[ODBC]` Python extra. Install it before running
+`hatch run unit-tests`:
+
+**MacOS:**
+```sh
+brew install unixodbc
+```
+
+**Debian / Ubuntu:**
+```sh
+sudo apt-get install -y unixodbc unixodbc-dev
+```
+
+**RHEL / Fedora:**
+```sh
+sudo dnf install -y unixODBC unixODBC-devel
+```
 
 ## CCCS Customizations
 
@@ -171,6 +186,93 @@ For legacy Spark catalogs that do not support the v2 path, you can revert to the
 flags:
   use_v1_relation_listing: true  # revert to legacy v1-first listing
 ```
+
+### Required Location Root (Default)
+
+By default, dbt-spark requires all table materializations to specify a `location_root` config. This ensures tables are always created at explicit, governed storage locations. If `location_root` is missing, dbt raises a compiler error.
+
+To disable this check (e.g., for managed tables where Spark controls the storage location), set the `require_location_root` flag to `false`.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `require_location_root` | `true` | Raises a compiler error when a table materialization does not specify `location_root` |
+
+**Usage in `dbt_project.yml`:**
+```yaml
+flags:
+  require_location_root: false  # allow tables without explicit location
+```
+
+**Model config:**
+```yaml
+models:
+  my_model:
+    +location_root: s3://my-bucket/warehouse
+```
+
+### Microbatch Concurrency (Iceberg only)
+
+`dbt-spark` declares `Capability.MicrobatchConcurrency = Full`, allowing dbt-core to
+schedule the batches of a `incremental_strategy: microbatch` model in parallel.
+
+**Requirements**
+
+- `file_format: 'iceberg'` is mandatory. Using `microbatch` with any other file
+  format (parquet, delta, hudi, hive, ...) raises a compiler error.
+- `partition_by` is mandatory (inherited from upstream microbatch validation).
+- An Iceberg catalog that supports concurrent commits on disjoint partitions
+  (Iceberg snapshot isolation handles the merge automatically).
+
+**Example**
+
+```yaml
+models:
+  events:
+    +incremental_strategy: microbatch
+    +file_format: iceberg
+    +event_time: event_time
+    +batch_size: day
+    +begin: '2024-01-01'
+    +partition_by:
+      - days(event_time)
+    # Optional: opt-out of parallel execution.
+    # +concurrent_batches: false
+```
+
+**How concurrency is made safe**
+
+1. **Per-batch tmp relation suffix.** Each batch's intermediate relation is
+   suffixed with `model.batch.id` (e.g. `events__dbt_tmp_20240115`) so
+   concurrent batches do not clobber each other's temp objects. Mirrors the
+   pattern in `dbt-adapters`'s base `make_temp_relation`.
+2. **No `partitionOverwriteMode` SET on the Iceberg path.** Iceberg's
+   `INSERT OVERWRITE` uses native dynamic-partition semantics via the Iceberg
+   SQL extensions and ignores `spark.sql.sources.partitionOverwriteMode`. The
+   session-level SET is therefore skipped, which also removes a race that
+   would otherwise be unavoidable: Apache Spark 3.5.6 cannot submit
+   multi-statement SQL, so the SET cannot be co-located with the INSERT in a
+   single submission.
+3. **Per-batch metadata sync is suppressed under concurrency.**
+   `check_partition_sync` and `sync_tblproperties` mutate table-level
+   metadata and cannot safely run from multiple workers at once. They are
+   skipped when dbt-core may schedule batches in parallel and still run when:
+   - the execution is not microbatch (regular incremental, full refresh), or
+   - the model explicitly sets `+concurrent_batches: false` (dbt-core then
+     guarantees a single batch is in flight at a time).
+
+**Limitations**
+
+- Iceberg only. There is no plan to extend this to Delta, Hudi, parquet, or
+  Hive in v1.
+- When `concurrent_batches` is `true` or unset, partition-spec drift and
+  `tblproperties` drift are not reconciled during the microbatch run. Run a
+  non-microbatch dbt invocation (or set `+concurrent_batches: false`) to
+  perform the reconciliation.
+- Spark 3.5.6 cannot submit multi-statement SQL; do not rely on session-level
+  `SET` statements to influence the per-batch INSERT.
+- First/last batches always run sequentially in dbt-core, but middle batches
+  may overlap them; do not assume single-writer semantics for any batch
+  unless `+concurrent_batches: false` is set.
 
 ## Contribute
 

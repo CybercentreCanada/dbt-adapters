@@ -94,11 +94,19 @@
     {#-- Relation must be merged --#}
     {#--
       Per-batch metadata mutations (`check_partition_sync` / `sync_tblproperties`)
-      race under concurrent microbatch execution and are unnecessary on
-      subsequent batches (the target already exists with the right schema/
-      properties). Only run on non-microbatch executions or the first batch.
+      race when multiple microbatch batches run in parallel. Skip them only
+      when dbt-core may schedule batches concurrently:
+
+        * Not a microbatch run                -> always safe to sync.
+        * `concurrent_batches: false`         -> dbt-core guarantees one batch
+                                                  in flight at a time, safe to sync.
+        * `concurrent_batches: true` or unset -> potentially parallel, skip.
+
+      See dbt-core's `MicrobatchBatchRunner.should_run_in_parallel` for the
+      authoritative resolution logic.
     --#}
-    {%- if not model.batch -%}
+    {%- set is_concurrent_microbatch = model.batch and config.get('concurrent_batches') != false -%}
+    {%- if not is_concurrent_microbatch -%}
       {% do adapter.check_partition_sync(target_relation, config.get('file_format'), config.get('partition_by')) %}
       {% do sync_tblproperties(target_relation, config.get('tblproperties')) %}
     {%- endif -%}

@@ -79,6 +79,17 @@ USE_V1_RELATION_LISTING = {
     ),
 }
 
+# CCCS behavior flag to require location_root on all table materializations
+REQUIRE_LOCATION_ROOT = {
+    "name": "require_location_root",
+    "default": True,
+    "description": (
+        "When enabled, dbt will raise a compiler error if a table materialization does not "
+        "specify a location_root config. This ensures all tables are created at explicit "
+        "storage locations."
+    ),
+}
+
 # CCCS
 from dbt.adapters.spark.python_submissions import (
     JobClusterPythonJobHelper,
@@ -205,6 +216,7 @@ class SparkAdapter(SQLAdapter):
             CHECK_PARTITION_SYNC,
             CHECK_PARTITION_SYNC_RAISES,
             USE_V1_RELATION_LISTING,
+            REQUIRE_LOCATION_ROOT,
         ]
 
     @classmethod
