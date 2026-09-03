@@ -406,6 +406,18 @@ flags:
   await_termination: true
 ```
 
+**Local streaming materialization tests**
+
+The opt-in local streaming test starts a local Spark 3.5.6 session and writes a
+`rate` stream to a temporary Iceberg catalog. It requires Java 11 or 17 and
+Maven/Ivy network access on its first run to fetch the Iceberg runtime package.
+
+```bash
+hatch run local-spark-tests:test
+```
+
+This test is intentionally separate from the standard unit-test command.
+
 **Iceberg streaming writer options**
 
 `stream_options` is valid only when `file_format: iceberg`. Values must be

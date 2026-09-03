@@ -35,6 +35,18 @@ unit-tests = "python -m pytest {args:tests/unit}"
 integration-tests = "python dagger/run_dbt_spark_tests.py {args:--profile apache_spark}"
 docker-prod = "docker build -f docker/Dockerfile -t dbt-spark ."
 
+[envs.local-spark-tests]
+detached = true
+dependencies = [
+    "jinja2>=3.1,<4.0",
+    "pyspark==3.5.6",
+    "pytest>=7.0,<8.0",
+    "pytest-xdist",
+]
+
+[envs.local-spark-tests.scripts]
+test = "DBT_RUN_LOCAL_SPARK_TESTS=1 python -m pytest --noconftest tests/unit/test_streaming_materialization_live.py -n 0 {args}"
+
 [envs.build]
 detached = true
 dependencies = [
