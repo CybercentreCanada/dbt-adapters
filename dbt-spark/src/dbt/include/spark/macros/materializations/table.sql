@@ -129,13 +129,11 @@ else:
   {# Import functions that can be used for partitioning See https://spark.apache.org/docs/3.5.5/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrameWriterV2.partitionedBy.html #}
   from pyspark.sql.functions import years, months, days, hours, bucket
   writer = df.writeTo("{{ target_relation }}") \
-    .using("{{ config.get('file_format', 'delta') }}") \
+    .using("{{ config.get('file_format', 'iceberg') }}") \
     .option("overwriteSchema", "true")
 
   {{ python__partitionedBy_clause() }}
-  {% if location_clause() -%}
-  writer = writer.option("path", "{{ location_clause() | trim }}".split("'")[1])
-  {%- endif %}
+{{ python__location_clause() | trim | indent(2, true) }}
   {{ python__tblproperties_clause() }}
 
   writer.create()

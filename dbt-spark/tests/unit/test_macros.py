@@ -174,6 +174,16 @@ class TestSparkMacros(unittest.TestCase):
         ).strip()
         self.assertEqual(sql, "create table my_table location '/mnt/root/my_table' as select 1")
 
+    def test_python_location_clause(self):
+        template = self.__get_template("adapters.sql")
+
+        self.config["location_root"] = "/mnt/root"
+        self.default_context["model"].alias = "my_table"
+        python = template.module.python__location_clause()
+
+        self.assertIn('target_location = "/mnt/root/my_table"', python)
+        self.assertIn('writer = writer.option("location", target_location)', python)
+
     def test_macros_create_table_as_comment(self):
         template = self.__get_template("adapters.sql")
 

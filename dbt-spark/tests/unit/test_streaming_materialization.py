@@ -50,6 +50,38 @@ def _stream_options(config):
     return template.module.spark__stream_options_clause()
 
 
+def _render_stream_table(macro_name: str) -> str:
+    environment = Environment(extensions=["jinja2.ext.do"])
+    template = environment.from_string(_jinja_source())
+    template.globals.update(
+        {
+            "config": type(
+                "Config",
+                (),
+                {"get": lambda _, key, default=None: {} if key == "stream_options" else default},
+            )(),
+            "adapter": type(
+                "Adapter", (), {"behavior": type("Behavior", (), {"await_termination": False})()}
+            )(),
+            "env_var": lambda _, default: default,
+            "location_clause": lambda: "",
+            "model": type("Model", (), {"refs": [], "sources": []})(),
+            "python__partitionedBy_clause": lambda: "",
+            "python__tblproperties_clause": lambda: "",
+            "return": lambda value: value,
+            "spark__escape_single_quotes": lambda value: value.replace("'", "\\'"),
+            "spark__stream_options_clause": lambda: "",
+        }
+    )
+    macro = getattr(template.module, macro_name)
+    compiled_code = (
+        "def model(dbt, spark):\n    return spark.readStream.table('source')"
+        if macro_name == "py_stream_table"
+        else "select 1"
+    )
+    return macro(compiled_code, "analytics.stream", False)
+
+
 def test_streaming_materialization_template_parses():
     Environment(extensions=["jinja2.ext.do"]).parse(_jinja_source())
 
@@ -84,6 +116,17 @@ def test_streaming_materialization_creates_v2_sink_and_syncs_metadata():
     assert "adapter.check_partition_sync" in source
     assert "sync_tblproperties" in source
     assert "persist_docs(target_relation, model)" in source
+
+
+@pytest.mark.parametrize("macro_name", ["py_stream_table", "sql_stream_table"])
+def test_streaming_materialization_preserves_runtime_dataframe_name(macro_name):
+    rendered = _render_stream_table(macro_name)
+
+    compile(rendered, f"{macro_name}.py", "exec")
+
+    assert "isinstance(df, pyspark.sql.dataframe.DataFrame)" in rendered
+    assert "spark.createDataFrame([], df.schema)" in rendered
+    assert "df.writeStream" in rendered
 
 
 def test_streaming_materialization_only_waits_when_configured():
