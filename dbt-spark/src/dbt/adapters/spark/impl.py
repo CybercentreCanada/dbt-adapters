@@ -111,6 +111,15 @@ REQUIRE_LOCATION_ROOT = {
     ),
 }
 
+AWAIT_TERMINATION = {
+    "name": "await_termination",
+    "default": False,
+    "description": (
+        "When enabled, dbt waits for a Python streaming model to terminate before completing "
+        "the run. A model-level await_termination config overrides this default."
+    ),
+}
+
 logger = AdapterLogger("Spark")
 packages = ["pyhive.hive", "thrift.transport", "thrift.protocol"]
 log_level = os.getenv("DBT_SPARK_LOG_LEVEL", "ERROR")
@@ -152,6 +161,9 @@ class SparkConfig(AdapterConfig):
     options: Optional[Dict[str, str]] = None
     tblproperties: Optional[Dict[str, str]] = None
     merge_update_columns: Optional[str] = None
+    await_termination: Optional[bool] = None
+    checkpoint_basedir: Optional[str] = None
+    trigger: Optional[str] = None
 
 
 class SparkAdapter(SQLAdapter):
@@ -225,6 +237,7 @@ class SparkAdapter(SQLAdapter):
             USE_V2_RELATION_LISTING,
             SET_PARTITION_OVERWRITE_MODE,
             REQUIRE_LOCATION_ROOT,
+            AWAIT_TERMINATION,
         ]
 
     @classmethod
