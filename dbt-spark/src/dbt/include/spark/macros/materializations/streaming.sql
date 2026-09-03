@@ -63,7 +63,7 @@ else:
 
 {% set await_termination = config.get('await_termination') %}
 {% if await_termination is none %}
-{% set await_termination = adapter.behavior.await_termination %}
+{% set await_termination = adapter.behavior.await_termination.no_warn %}
 {% endif %}
 if {{ await_termination }}:
     active_query.awaitTermination()
@@ -108,7 +108,7 @@ else:
 
 {% set await_termination = config.get('await_termination') %}
 {% if await_termination is none %}
-{% set await_termination = adapter.behavior.await_termination %}
+{% set await_termination = adapter.behavior.await_termination.no_warn %}
 {% endif %}
 if {{ await_termination }}:
     active_query.awaitTermination()

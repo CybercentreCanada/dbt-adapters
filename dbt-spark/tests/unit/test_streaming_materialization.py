@@ -50,7 +50,7 @@ def _stream_options(config):
     return template.module.spark__stream_options_clause()
 
 
-def _render_stream_table(macro_name: str) -> str:
+def _render_stream_table(macro_name: str, await_termination: bool = False) -> str:
     environment = Environment(extensions=["jinja2.ext.do"])
     template = environment.from_string(_jinja_source())
     template.globals.update(
@@ -61,7 +61,19 @@ def _render_stream_table(macro_name: str) -> str:
                 {"get": lambda _, key, default=None: {} if key == "stream_options" else default},
             )(),
             "adapter": type(
-                "Adapter", (), {"behavior": type("Behavior", (), {"await_termination": False})()}
+                "Adapter",
+                (),
+                {
+                    "behavior": type(
+                        "Behavior",
+                        (),
+                        {
+                            "await_termination": type(
+                                "BehaviorFlag", (), {"no_warn": await_termination}
+                            )()
+                        },
+                    )()
+                },
             )(),
             "env_var": lambda _, default: default,
             "location_clause": lambda: "",
@@ -119,20 +131,23 @@ def test_streaming_materialization_creates_v2_sink_and_syncs_metadata():
 
 
 @pytest.mark.parametrize("macro_name", ["py_stream_table", "sql_stream_table"])
-def test_streaming_materialization_preserves_runtime_dataframe_name(macro_name):
-    rendered = _render_stream_table(macro_name)
+@pytest.mark.parametrize("await_termination", [False, True])
+def test_streaming_materialization_preserves_runtime_dataframe_name(macro_name, await_termination):
+    rendered = _render_stream_table(macro_name, await_termination)
 
     compile(rendered, f"{macro_name}.py", "exec")
 
     assert "isinstance(df, pyspark.sql.dataframe.DataFrame)" in rendered
     assert "spark.createDataFrame([], df.schema)" in rendered
     assert "df.writeStream" in rendered
+    assert f"if {await_termination}:" in rendered
+    assert "BehaviorFlag" not in rendered
 
 
 def test_streaming_materialization_only_waits_when_configured():
     source = _source()
 
-    assert "adapter.behavior.await_termination" in source
+    assert "adapter.behavior.await_termination.no_warn" in source
     assert "if {{ await_termination }}:" in source
     assert "active_query.awaitTermination()" in source
 
