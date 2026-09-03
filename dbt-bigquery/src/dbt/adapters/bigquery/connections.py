@@ -22,7 +22,6 @@ from google.cloud.bigquery import (
     Table,
     TableReference,
 )
-from google.cloud.bigquery.retry import DEFAULT_JOB_RETRY
 from google.cloud.exceptions import BadRequest, Forbidden, NotFound
 
 from dbt_common.events.contextvars import get_node_info
@@ -423,14 +422,23 @@ class BigQueryConnectionManager(BaseConnectionManager):
         return f"https://console.cloud.google.com/bigquery?project={project_id}&j=bq:{location}:{job_id}&page=queryresults"
 
     def get_partitions_metadata(self, table):
-        def standard_to_legacy(table):
-            return table.project + ":" + table.dataset + "." + table.identifier
+        if getattr(self, "use_standard_sql_for_partitions", False):
+            sql = f"""
+                SELECT partition_id
+                FROM `{table.project}.{table.dataset}.INFORMATION_SCHEMA.PARTITIONS`
+                WHERE table_name = '{table.identifier}'
+            """
+            sql = self._add_query_comment(sql)
+            _, iterator = self.raw_execute(sql, use_legacy_sql=False)
+        else:
 
-        legacy_sql = "SELECT * FROM [" + standard_to_legacy(table) + "$__PARTITIONS_SUMMARY__]"
+            def standard_to_legacy(table):
+                return table.project + ":" + table.dataset + "." + table.identifier
 
-        sql = self._add_query_comment(legacy_sql)
-        # auto_begin is ignored on bigquery, and only included for consistency
-        _, iterator = self.raw_execute(sql, use_legacy_sql=True)
+            legacy_sql = "SELECT * FROM [" + standard_to_legacy(table) + "$__PARTITIONS_SUMMARY__]"
+            sql = self._add_query_comment(legacy_sql)
+            _, iterator = self.raw_execute(sql, use_legacy_sql=True)
+
         return self.get_table_from_response(iterator)
 
     def copy_bq_table(self, source, destination, write_disposition) -> None:
@@ -634,7 +642,7 @@ class BigQueryConnectionManager(BaseConnectionManager):
             iterator = query_job.result(
                 max_results=limit,
                 timeout=polling_timeout,
-                retry=DEFAULT_JOB_RETRY.with_timeout(timeout),
+                retry=self._retry.create_query_job_polling_retry(query_job),
             )
         except TimeoutError:
             exc = f"Operation did not complete within the designated timeout of {timeout} seconds."

@@ -98,12 +98,24 @@
 
 
 {% macro redshift__create_schema(relation) -%}
-  {{ postgres__create_schema(relation) }}
+  {% if redshift__use_show_apis() %}
+    {%- call statement('create_schema') -%}
+      create schema if not exists {{ relation.without_identifier() }}
+    {%- endcall -%}
+  {% else %}
+    {{ postgres__create_schema(relation) }}
+  {% endif %}
 {% endmacro %}
 
 
 {% macro redshift__drop_schema(relation) -%}
-  {{ postgres__drop_schema(relation) }}
+  {% if redshift__use_show_apis() %}
+    {%- call statement('drop_schema') -%}
+      drop schema if exists {{ relation.without_identifier() }} cascade
+    {%- endcall -%}
+  {% else %}
+    {{ postgres__drop_schema(relation) }}
+  {% endif %}
 {% endmacro %}
 
 
@@ -121,18 +133,21 @@
 
 {% macro redshift__get_columns_in_relation_show(relation) -%}
   {% call statement('get_columns_in_relation', fetch_result=True) %}
-    SHOW COLUMNS FROM TABLE {{ relation.database }}.{{ relation.schema }}.{{ relation.identifier }}
+    SHOW COLUMNS FROM TABLE {{ adapter.quote(relation.database) }}.{{ adapter.quote(relation.schema) }}.{{ adapter.quote(relation.identifier) }}
   {% endcall %}
   {% set table = load_result('get_columns_in_relation').table %}
   {% set columns = [] %}
   {% for row in table %}
-    {% do columns.append(api.Column(
-      column=row['column_name'],
-      dtype=row['data_type'],
-      char_size=row['character_maximum_length'],
-      numeric_precision=row['numeric_precision'],
-      numeric_scale=row['numeric_scale']
-    )) %}
+    {# filter out Redshift internal pg.dropped markers that can appear after ALTER TABLE DROP COLUMN #}
+    {% if 'pg.dropped.' not in row['column_name'] %}
+      {% do columns.append(api.Column(
+        column=row['column_name'],
+        dtype=row['data_type'],
+        char_size=row['character_maximum_length'],
+        numeric_precision=row['numeric_precision'],
+        numeric_scale=row['numeric_scale']
+      )) %}
+    {% endif %}
   {% endfor %}
   {{ return(columns) }}
 {% endmacro %}
@@ -259,10 +274,12 @@
 {% macro redshift__list_relations_without_caching(schema_relation) %}
   {% if redshift__use_show_apis() %}
     {% call statement('show_tables', fetch_result=True) -%}
-      SHOW TABLES FROM SCHEMA {{ schema_relation.database }}.{{ schema_relation.schema }}
+      SHOW TABLES FROM SCHEMA {{ adapter.quote(schema_relation.database) }}.{{ adapter.quote(schema_relation.schema) }}
     {% endcall %}
     {% set show_result = load_result('show_tables').table %}
-    {{ return(adapter.transform_show_tables_for_list_relations(show_result)) }}
+    {% set table_and_view_relations = adapter.transform_show_tables_for_list_relations(show_result) %}
+    {% set function_relations = list_function_relations_without_caching(schema_relation) %}
+    {{ return(adapter.combine_show_tables_and_function_relations(table_and_view_relations, function_relations)) }}
   {% else %}
     {% call statement('list_relations_without_caching', fetch_result=True) -%}
       select
@@ -285,9 +302,39 @@
         end as type
       from information_schema.views
       where table_schema ilike '{{ schema_relation.schema }}'
+      union all
+      select distinct
+        '{{ schema_relation.database }}' as database,
+        proname as name,
+        ns.nspname as schema,
+        'function' as type
+      from pg_proc
+      join pg_namespace as ns on pronamespace = ns.oid
+      where ns.nspname ilike '{{ schema_relation.schema }}'
     {% endcall %}
     {{ return(load_result('list_relations_without_caching').table) }}
   {% endif %}
+{% endmacro %}
+
+
+{% macro redshift__list_function_relations_without_caching(schema_relation) %}
+  {#
+    There is no SHOW API equivalent for functions in Redshift (unlike `SHOW TABLES FROM SCHEMA`),
+    so we always use pg_proc regardless of the `use_show_apis` flag. This is safe because
+    Redshift datasharing does not support sharing UDFs or stored procedures across databases,
+    meaning functions are always local to the current database.
+  #}
+  {% call statement('list_function_relations_without_caching', fetch_result=True) -%}
+    select distinct
+      '{{ schema_relation.database }}' as database,
+      proname::varchar as name,
+      ns.nspname::varchar as schema,
+      'function' as type
+    from pg_proc
+    join pg_namespace as ns on pronamespace = ns.oid
+    where ns.nspname ilike '{{ schema_relation.schema }}'
+  {% endcall %}
+  {{ return(load_result('list_function_relations_without_caching').table) }}
 {% endmacro %}
 
 {% macro redshift__information_schema_name(database) -%}
@@ -297,8 +344,17 @@
 
 {% macro redshift__list_schemas(database) %}
   {% if redshift__use_show_apis() %}
+    {# dbt-core's create_schemas passes a pre-quoted identifier via str(relation);
+       other callers pass the raw database name. Only quote when the input is not
+       already wrapped in double-quotes, so the identifier is quoted exactly once —
+       required for databases with hyphens. #}
+    {%- if database.startswith('"') and database.endswith('"') -%}
+      {%- set _quoted_database = database -%}
+    {%- else -%}
+      {%- set _quoted_database = adapter.quote(database) -%}
+    {%- endif -%}
     {% call statement('list_schemas', fetch_result=True) -%}
-      SHOW SCHEMAS FROM DATABASE {{ database }}
+      SHOW SCHEMAS FROM DATABASE {{ _quoted_database }}
     {% endcall %}
     {%- set table = load_result('list_schemas').table -%}
     {%- set schemas = [] -%}
@@ -314,7 +370,7 @@
 {% macro redshift__check_schema_exists(information_schema, schema) %}
   {% if redshift__use_show_apis() %}
     {% call statement('check_schema_exists', fetch_result=True) -%}
-      SHOW SCHEMAS FROM DATABASE {{ information_schema.database }}
+      SHOW SCHEMAS FROM DATABASE {{ adapter.quote(information_schema.database) }}
       LIKE '{{ schema }}'
     {% endcall %}
     {%- set table = load_result('check_schema_exists').table -%}
@@ -335,7 +391,12 @@
   {# Override: do not set column comments for LBVs #}
   {% set is_lbv = relation.type == 'view' and config.get('bind') == false %}
   {% if for_columns and config.persist_column_docs() and model.columns and not is_lbv %}
-    {% do run_query(alter_column_comment(relation, model.columns)) %}
+    {% set existing_columns = adapter.get_columns_in_relation(relation) | map(attribute="name") | list %}
+    {% set filtered_columns = validate_doc_columns(relation, model.columns, existing_columns) %}
+    {% set alter_comment_sql = alter_column_comment(relation, filtered_columns) %}
+    {% if alter_comment_sql and alter_comment_sql | trim | length > 0 %}
+      {% do run_query(alter_comment_sql) %}
+    {% endif %}
   {% endif %}
 {% endmacro %}
 
@@ -370,9 +431,15 @@
     Redshift ALTER COLUMN TYPE only supports VARCHAR and VARBYTE (size changes).
     For those, use native ALTER; for any other type change, fall back to
     default add/copy/drop/rename.
+
+    The native ALTER TABLE ALTER COLUMN cannot run inside a transaction block.
+    It is only safe to use when `redshift_skip_autocommit_transaction_statements`
+    is enabled (i.e. we are not wrapping statements in BEGIN/COMMIT).
+    When the flag is off, always use the default migration path.
   #}
   {% set type_lower = (new_column_type | lower) | trim %}
-  {% if type_lower[:7] == 'varchar' or type_lower[:17] == 'character varying' or type_lower[:7] == 'varbyte' %}
+  {% set skip_txn = adapter.behavior.redshift_skip_autocommit_transaction_statements.no_warn %}
+  {% if skip_txn and (type_lower[:7] == 'varchar' or type_lower[:17] == 'character varying' or type_lower[:7] == 'varbyte') %}
     {% call statement('alter_column_type') %}
       alter table {{ relation.render() }} alter column {{ adapter.quote(column_name) }} type {{ new_column_type }}
     {% endcall %}
@@ -406,4 +473,12 @@
 
   {% endif %}
 
+{% endmacro %}
+
+
+{% macro redshift__show_tables_from_schema(database, schema) %}
+    {%- call statement('show_tables', fetch_result=True) -%}
+        SHOW TABLES FROM SCHEMA {{ adapter.quote(database) }}.{{ adapter.quote(schema) }}
+    {%- endcall -%}
+    {{ return(load_result('show_tables')) }}
 {% endmacro %}

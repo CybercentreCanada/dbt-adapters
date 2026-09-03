@@ -1,0 +1,4 @@
+kind: Features
+body: |
+  Add `set_partition_overwrite_mode` behavior flag (default true) that controls whether `SET spark.sql.sources.partitionOverwriteMode = DYNAMIC` is emitted before insert_overwrite and microbatch operations with partition_by. On Iceberg this is a no-op (Iceberg handles dynamic overwrite natively), but it serves as a defensive measure. Disable with `set_partition_overwrite_mode: false` in dbt_project.yml flags if the session-level SET causes issues in your environment.
+time: 2026-05-29T00:00:05.000000-08:00

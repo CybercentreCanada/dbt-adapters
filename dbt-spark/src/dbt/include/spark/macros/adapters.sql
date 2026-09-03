@@ -3,11 +3,14 @@
 {%- endmacro -%}
 
 {% macro spark__tblproperties_clause() -%}
-  {%- set tblproperties = config.get('tblproperties') -%}
-  {%- if tblproperties is not none %}
+  {%- if config.get('file_format', validator=validation.any[basestring]) != 'iceberg' -%}
+    {{ return('') }}
+  {%- endif -%}
+  {%- set tblproperties = spark__filtered_tblproperties(config.get('tblproperties')) -%}
+  {%- if tblproperties is not none and tblproperties | length > 0 %}
     tblproperties (
       {%- for prop in tblproperties -%}
-      '{{ prop }}' = '{{ tblproperties[prop] }}' {% if not loop.last %}, {% endif %}
+      '{{ prop }}' = '{{ spark__escape_single_quotes(tblproperties[prop]) }}' {% if not loop.last %}, {% endif %}
       {%- endfor %}
     )
   {%- endif %}
@@ -29,13 +32,32 @@
   {{ return(adapter.dispatch('location_clause', 'dbt')()) }}
 {%- endmacro -%}
 
+{% macro spark__validate_streaming_options_config(materialization) %}
+  {%- for option_name in ('read_stream_options', 'write_stream_options') -%}
+    {%- if config.get(option_name) is not none -%}
+      {{ exceptions.raise_compiler_error("'" ~ option_name ~ "' is only supported for materialized='streaming'; remove it from this " ~ materialization ~ " model.") }}
+    {%- endif -%}
+  {%- endfor -%}
+{% endmacro %}
+
 {% macro spark__location_clause() %}
   {%- set location_root = config.get('location_root', validator=validation.any[basestring]) -%}
   {%- set identifier = model['alias'] -%}
   {%- if location_root is not none %}
     location '{{ location_root }}/{{ identifier }}'
-  {%- else %}
-    {{ exceptions.raise_compiler_error("location_root is required for location_clause") }}
+  {%- elif adapter.behavior.require_location_root %}
+    {{ exceptions.raise_compiler_error("location_root is required for model '" ~ identifier ~ "'. Set location_root in your model config or disable the require_location_root flag.") }}
+  {%- endif %}
+{%- endmacro -%}
+
+{% macro python__location_clause() %}
+  {%- set location_root = config.get('location_root', validator=validation.any[basestring]) -%}
+  {%- set identifier = model['alias'] -%}
+  {%- if location_root is not none -%}
+target_location = {{ (location_root ~ '/' ~ identifier) | tojson }}
+writer = writer.option("location", target_location)
+  {%- elif adapter.behavior.require_location_root %}
+    {{ exceptions.raise_compiler_error("location_root is required for model '" ~ identifier ~ "'. Set location_root in your model config or disable the require_location_root flag.") }}
   {%- endif %}
 {%- endmacro -%}
 
@@ -359,7 +381,9 @@
 
 {% macro spark__persist_docs(relation, model, for_relation, for_columns) -%}
   {% if for_columns and config.persist_column_docs() and model.columns %}
-    {% do alter_column_comment(relation, model.columns) %}
+    {%- set existing_columns = adapter.get_columns_in_relation(relation) -%}
+    {%- set columns_to_update = adapter.get_persist_doc_columns(existing_columns, model.columns) -%}
+    {% do alter_column_comment(relation, columns_to_update) %}
   {% endif %}
 {% endmacro %}
 

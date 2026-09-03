@@ -3,10 +3,15 @@ import pytest
 from multiprocessing import get_context
 from unittest import mock
 
-from dbt.exceptions import DbtRuntimeError
+from dbt_common.exceptions import DbtRuntimeError
 from agate import Row
 from pyhive import hive
-from dbt.adapters.spark import SparkAdapter, SparkRelation
+from dbt.adapters.spark import SparkAdapter, SparkColumn, SparkRelation
+from dbt.adapters.spark.impl import (
+    LIST_RELATIONS_MACRO_NAME,
+    SCHEMA_NOT_FOUND_MESSAGES,
+    TABLE_OR_VIEW_NOT_FOUND_MESSAGES,
+)
 from .utils import config_from_parts_or_dicts
 
 ENFORCED_SPARK_CONFIG = {"spark.sql.ansi.enabled": "false"}
@@ -206,32 +211,29 @@ class TestSparkAdapter(unittest.TestCase):
 
         # Mimics the output of Spark with a DESCRIBE TABLE EXTENDED
         plain_rows = [
-            ("col1", "decimal(22,0)"),
-            (
-                "col2",
-                "string",
-            ),
-            ("dt", "date"),
-            ("struct_col", "struct<struct_inner_col:string>"),
-            ("# Partition Information", "data_type"),
-            ("# col_name", "data_type"),
-            ("dt", "date"),
-            (None, None),
-            ("# Detailed Table Information", None),
-            ("Database", None),
-            ("Owner", "root"),
-            ("Created Time", "Wed Feb 04 18:15:00 UTC 1815"),
-            ("Last Access", "Wed May 20 19:25:00 UTC 1925"),
-            ("Type", "MANAGED"),
-            ("Provider", "delta"),
-            ("Location", "/mnt/vo"),
-            ("Serde Library", "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe"),
-            ("InputFormat", "org.apache.hadoop.mapred.SequenceFileInputFormat"),
-            ("OutputFormat", "org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat"),
-            ("Partition Provider", "Catalog"),
+            ("col1", "decimal(22,0)", None),
+            ("col2", "string", None),
+            ("dt", "date", None),
+            ("struct_col", "struct<struct_inner_col:string>", None),
+            ("# Partition Information", "data_type", None),
+            ("# col_name", "data_type", None),
+            ("dt", "date", None),
+            (None, None, None),
+            ("# Detailed Table Information", None, None),
+            ("Database", None, None),
+            ("Owner", "root", None),
+            ("Created Time", "Wed Feb 04 18:15:00 UTC 1815", None),
+            ("Last Access", "Wed May 20 19:25:00 UTC 1925", None),
+            ("Type", "MANAGED", None),
+            ("Provider", "delta", None),
+            ("Location", "/mnt/vo", None),
+            ("Serde Library", "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe", None),
+            ("InputFormat", "org.apache.hadoop.mapred.SequenceFileInputFormat", None),
+            ("OutputFormat", "org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat", None),
+            ("Partition Provider", "Catalog", None),
         ]
 
-        input_cols = [Row(keys=["col_name", "data_type"], values=r) for r in plain_rows]
+        input_cols = [Row(keys=["col_name", "data_type", "comment"], values=r) for r in plain_rows]
 
         rows = SparkAdapter(self.target_http, get_context("spawn")).parse_describe_extended(
             relation, input_cols
@@ -251,6 +253,7 @@ class TestSparkAdapter(unittest.TestCase):
                 "numeric_scale": None,
                 "numeric_precision": None,
                 "char_size": None,
+                "comment": None,
             },
         )
 
@@ -268,6 +271,7 @@ class TestSparkAdapter(unittest.TestCase):
                 "numeric_scale": None,
                 "numeric_precision": None,
                 "char_size": None,
+                "comment": None,
             },
         )
 
@@ -285,6 +289,7 @@ class TestSparkAdapter(unittest.TestCase):
                 "numeric_scale": None,
                 "numeric_precision": None,
                 "char_size": None,
+                "comment": None,
             },
         )
 
@@ -302,6 +307,7 @@ class TestSparkAdapter(unittest.TestCase):
                 "numeric_scale": None,
                 "numeric_precision": None,
                 "char_size": None,
+                "comment": None,
             },
         )
 
@@ -316,12 +322,12 @@ class TestSparkAdapter(unittest.TestCase):
 
         # Mimics the output of Spark with a DESCRIBE TABLE EXTENDED
         plain_rows = [
-            ("col1", "decimal(22,0)"),
-            ("# Detailed Table Information", None),
-            ("Owner", 1234),
+            ("col1", "decimal(22,0)", None),
+            ("# Detailed Table Information", None, None),
+            ("Owner", 1234, None),
         ]
 
-        input_cols = [Row(keys=["col_name", "data_type"], values=r) for r in plain_rows]
+        input_cols = [Row(keys=["col_name", "data_type", "comment"], values=r) for r in plain_rows]
 
         rows = SparkAdapter(self.target_http, get_context("spawn")).parse_describe_extended(
             relation, input_cols
@@ -340,25 +346,25 @@ class TestSparkAdapter(unittest.TestCase):
 
         # Mimics the output of Spark with a DESCRIBE TABLE EXTENDED
         plain_rows = [
-            ("col1", "decimal(22,0)"),
-            ("# Partition Information", "data_type"),
-            (None, None),
-            ("# Detailed Table Information", None),
-            ("Database", None),
-            ("Owner", "root"),
-            ("Created Time", "Wed Feb 04 18:15:00 UTC 1815"),
-            ("Last Access", "Wed May 20 19:25:00 UTC 1925"),
-            ("Statistics", "1109049927 bytes, 14093476 rows"),
-            ("Type", "MANAGED"),
-            ("Provider", "delta"),
-            ("Location", "/mnt/vo"),
-            ("Serde Library", "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe"),
-            ("InputFormat", "org.apache.hadoop.mapred.SequenceFileInputFormat"),
-            ("OutputFormat", "org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat"),
-            ("Partition Provider", "Catalog"),
+            ("col1", "decimal(22,0)", None),
+            ("# Partition Information", "data_type", None),
+            (None, None, None),
+            ("# Detailed Table Information", None, None),
+            ("Database", None, None),
+            ("Owner", "root", None),
+            ("Created Time", "Wed Feb 04 18:15:00 UTC 1815", None),
+            ("Last Access", "Wed May 20 19:25:00 UTC 1925", None),
+            ("Statistics", "1109049927 bytes, 14093476 rows", None),
+            ("Type", "MANAGED", None),
+            ("Provider", "delta", None),
+            ("Location", "/mnt/vo", None),
+            ("Serde Library", "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe", None),
+            ("InputFormat", "org.apache.hadoop.mapred.SequenceFileInputFormat", None),
+            ("OutputFormat", "org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat", None),
+            ("Partition Provider", "Catalog", None),
         ]
 
-        input_cols = [Row(keys=["col_name", "data_type"], values=r) for r in plain_rows]
+        input_cols = [Row(keys=["col_name", "data_type", "comment"], values=r) for r in plain_rows]
 
         rows = SparkAdapter(self.target_http, get_context("spawn")).parse_describe_extended(
             relation, input_cols
@@ -378,6 +384,7 @@ class TestSparkAdapter(unittest.TestCase):
                 "numeric_scale": None,
                 "numeric_precision": None,
                 "char_size": None,
+                "comment": None,
                 "stats:bytes:description": "",
                 "stats:bytes:include": True,
                 "stats:bytes:label": "bytes",
@@ -393,9 +400,11 @@ class TestSparkAdapter(unittest.TestCase):
         adapter = SparkAdapter(self.target_http, get_context("spawn"))
         # fine
         adapter.Relation.create(schema="different", identifier="table")
-        with self.assertRaises(DbtRuntimeError):
-            # not fine - database set
-            adapter.Relation.create(database="something", schema="different", identifier="table")
+        # CCCS: database is now allowed on SparkRelation (cross-database/catalog support)
+        relation = adapter.Relation.create(
+            database="something", schema="different", identifier="table"
+        )
+        self.assertEqual(relation.database, "something")
 
     def test_profile_with_database(self):
         profile = {
@@ -488,6 +497,7 @@ class TestSparkAdapter(unittest.TestCase):
                 "numeric_scale": None,
                 "numeric_precision": None,
                 "char_size": None,
+                "comment": None,
                 "stats:bytes:description": "",
                 "stats:bytes:include": True,
                 "stats:bytes:label": "bytes",
@@ -509,6 +519,7 @@ class TestSparkAdapter(unittest.TestCase):
                 "numeric_scale": None,
                 "numeric_precision": None,
                 "char_size": None,
+                "comment": None,
                 "stats:bytes:description": "",
                 "stats:bytes:include": True,
                 "stats:bytes:label": "bytes",
@@ -574,6 +585,7 @@ class TestSparkAdapter(unittest.TestCase):
                 "numeric_scale": None,
                 "numeric_precision": None,
                 "char_size": None,
+                "comment": None,
             },
         )
 
@@ -591,6 +603,7 @@ class TestSparkAdapter(unittest.TestCase):
                 "numeric_scale": None,
                 "numeric_precision": None,
                 "char_size": None,
+                "comment": None,
             },
         )
 
@@ -642,6 +655,7 @@ class TestSparkAdapter(unittest.TestCase):
                 "numeric_scale": None,
                 "numeric_precision": None,
                 "char_size": None,
+                "comment": None,
                 "stats:bytes:description": "",
                 "stats:bytes:include": True,
                 "stats:bytes:label": "bytes",
@@ -667,6 +681,7 @@ class TestSparkAdapter(unittest.TestCase):
                 "numeric_scale": None,
                 "numeric_precision": None,
                 "char_size": None,
+                "comment": None,
                 "stats:bytes:description": "",
                 "stats:bytes:include": True,
                 "stats:bytes:label": "bytes",
@@ -677,3 +692,252 @@ class TestSparkAdapter(unittest.TestCase):
                 "stats:rows:value": 12345678,
             },
         )
+
+
+class TestListRelationsWithoutCaching(unittest.TestCase):
+    @pytest.fixture(autouse=True)
+    def set_up_fixtures(self, target_http):
+        self.target_http = target_http
+
+    def _make_adapter(self):
+        return SparkAdapter(self.target_http, get_context("spawn"))
+
+    def _make_schema_relation(self, adapter, schema="analytics"):
+        return adapter.Relation.create(schema=schema, identifier="").without_identifier()
+
+    def test_unknown_error_is_raised(self):
+        """An unexpected error from the metastore should propagate rather than
+        silently returning an empty list, which would cause incremental models
+        to recreate tables and lose data (issue #1289)."""
+        adapter = self._make_adapter()
+        schema_relation = self._make_schema_relation(adapter)
+
+        with mock.patch.object(
+            adapter,
+            "execute_macro",
+            side_effect=DbtRuntimeError("Connection to Hive Metastore failed"),
+        ):
+            with self.assertRaises(DbtRuntimeError):
+                adapter.list_relations_without_caching(schema_relation)
+
+    def test_schema_not_found_returns_empty(self):
+        """When the schema/database genuinely does not exist (legacy Hive
+        'Database not found' message), an empty list should be returned."""
+        adapter = self._make_adapter()
+        schema_relation = self._make_schema_relation(adapter, schema="nonexistent")
+
+        with mock.patch.object(
+            adapter,
+            "execute_macro",
+            side_effect=DbtRuntimeError("Database not found"),
+        ):
+            result = adapter.list_relations_without_caching(schema_relation)
+            self.assertEqual(result, [])
+
+
+@pytest.mark.parametrize("not_found_msg", SCHEMA_NOT_FOUND_MESSAGES)
+def test_all_schema_not_found_messages_return_empty(not_found_msg, target_http):
+    """Every message in SCHEMA_NOT_FOUND_MESSAGES should cause
+    list_relations_without_caching to return [] rather than raise.
+    This covers engine-specific variants such as Spark SQL's [SCHEMA_NOT_FOUND]."""
+    adapter = SparkAdapter(target_http, get_context("spawn"))
+    schema_relation = adapter.Relation.create(
+        schema="nonexistent", identifier=""
+    ).without_identifier()
+
+    with mock.patch.object(
+        adapter,
+        "execute_macro",
+        side_effect=DbtRuntimeError(not_found_msg),
+    ):
+        result = adapter.list_relations_without_caching(schema_relation)
+        assert result == []
+
+
+@pytest.mark.parametrize("not_found_msg", TABLE_OR_VIEW_NOT_FOUND_MESSAGES)
+def test_all_table_or_view_not_found_messages_return_empty(not_found_msg, target_http):
+    """Every message in TABLE_OR_VIEW_NOT_FOUND_MESSAGES should cause
+    list_relations_without_caching to return [] rather than raise.
+    This covers Databricks/Simba errors like [TABLE_OR_VIEW_NOT_FOUND] that
+    surface when a schema has no matching tables."""
+    adapter = SparkAdapter(target_http, get_context("spawn"))
+    schema_relation = adapter.Relation.create(
+        schema="nonexistent", identifier=""
+    ).without_identifier()
+
+    with mock.patch.object(
+        adapter,
+        "execute_macro",
+        side_effect=DbtRuntimeError(not_found_msg),
+    ):
+        result = adapter.list_relations_without_caching(schema_relation)
+        assert result == []
+
+
+ICEBERG_V2_ERROR = "SHOW TABLE EXTENDED is not supported for v2 tables"
+
+
+class TestListRelationsIcebergV2Fallback(unittest.TestCase):
+    """Tests for the Iceberg v2 fallback path inside list_relations_without_caching.
+
+    When the primary SHOW TABLE EXTENDED macro raises the v2-table error, the adapter
+    falls back to a SHOW TABLES macro.  Unexpected errors from *that* fallback should
+    propagate rather than be swallowed.
+    """
+
+    @pytest.fixture(autouse=True)
+    def set_up_fixtures(self, target_http):
+        self.target_http = target_http
+
+    def _make_adapter(self):
+        return SparkAdapter(self.target_http, get_context("spawn"))
+
+    def _make_schema_relation(self, adapter, schema="analytics"):
+        return adapter.Relation.create(schema=schema, identifier="").without_identifier()
+
+    def test_iceberg_v2_fallback_returns_relations(self):
+        """When the primary macro raises the v2-table error, the fallback SHOW TABLES
+        macro is called and its results are returned successfully."""
+        adapter = self._make_adapter()
+        schema_relation = self._make_schema_relation(adapter)
+
+        fallback_rows = mock.MagicMock()
+        fallback_rows.__iter__ = mock.Mock(return_value=iter([]))
+
+        def execute_macro_side_effect(macro_name, *args, **kwargs):
+            if macro_name == LIST_RELATIONS_MACRO_NAME:
+                raise DbtRuntimeError(ICEBERG_V2_ERROR)
+            return fallback_rows
+
+        with mock.patch.object(adapter, "execute_macro", side_effect=execute_macro_side_effect):
+            with mock.patch.object(
+                adapter, "_build_spark_relation_list", return_value=[]
+            ) as mock_build:
+                result = adapter.list_relations_without_caching(schema_relation)
+                self.assertEqual(result, [])
+                mock_build.assert_called_once()
+
+    def test_iceberg_v2_fallback_error_propagates(self):
+        """If the fallback SHOW TABLES macro itself raises an unexpected error, that
+        error should propagate rather than being silently swallowed."""
+        adapter = self._make_adapter()
+        schema_relation = self._make_schema_relation(adapter)
+
+        def execute_macro_side_effect(macro_name, *args, **kwargs):
+            if macro_name == LIST_RELATIONS_MACRO_NAME:
+                raise DbtRuntimeError(ICEBERG_V2_ERROR)
+            raise DbtRuntimeError("Unexpected fallback failure")
+
+        with mock.patch.object(adapter, "execute_macro", side_effect=execute_macro_side_effect):
+            with self.assertRaises(DbtRuntimeError):
+                adapter.list_relations_without_caching(schema_relation)
+
+
+class TestGetColumnsForCatalogIcebergFallback(unittest.TestCase):
+    """Tests for _get_columns_for_catalog falling back to get_columns_in_relation
+    when the information string (from the DESCRIBE EXTENDED / Iceberg v2 path)
+    does not contain column definitions in the regex-parseable format."""
+
+    @pytest.fixture(autouse=True)
+    def set_up_fixtures(self, target_http):
+        self.target_http = target_http
+
+    def _make_adapter(self):
+        return SparkAdapter(self.target_http, get_context("spawn"))
+
+    def test_falls_back_to_get_columns_in_relation(self):
+        """When parse_columns_from_information returns nothing,
+        _get_columns_for_catalog should fall back to get_columns_in_relation."""
+        adapter = self._make_adapter()
+
+        # Information string with no ' |-- col: type (nullable = ...)' lines,
+        # so parse_columns_from_information will return an empty list.
+        information = "id: int\n" "name: string\n" "Provider: iceberg\n" "Owner: root\n"
+        relation = SparkRelation.create(
+            schema="default",
+            identifier="orders",
+            type=SparkRelation.get_relation_type.Table,
+            information=information,
+        )
+
+        fallback_columns = [
+            SparkColumn(
+                table_database=None,
+                table_schema="default",
+                table_name="orders",
+                table_type=SparkRelation.get_relation_type.Table,
+                column_index=0,
+                table_owner="root",
+                column="id",
+                dtype="int",
+            ),
+            SparkColumn(
+                table_database=None,
+                table_schema="default",
+                table_name="orders",
+                table_type=SparkRelation.get_relation_type.Table,
+                column_index=1,
+                table_owner="root",
+                column="name",
+                dtype="string",
+            ),
+        ]
+
+        with mock.patch.object(
+            adapter, "get_columns_in_relation", return_value=fallback_columns
+        ) as mock_get_cols:
+            result = list(adapter._get_columns_for_catalog(relation))
+
+        mock_get_cols.assert_called_once_with(relation)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["column_name"], "id")
+        self.assertEqual(result[0]["column_type"], "int")
+        self.assertEqual(result[1]["column_name"], "name")
+        self.assertEqual(result[1]["column_type"], "string")
+
+    def test_does_not_fall_back_when_information_has_columns(self):
+        """When parse_columns_from_information succeeds (SHOW TABLE EXTENDED path),
+        get_columns_in_relation should NOT be called."""
+        adapter = self._make_adapter()
+
+        # Standard information string with the regex-parseable format
+        information = (
+            "Owner: root\n"
+            "Schema: root\n"
+            " |-- id: int (nullable = true)\n"
+            " |-- name: string (nullable = true)\n"
+        )
+        relation = SparkRelation.create(
+            schema="default",
+            identifier="orders",
+            type=SparkRelation.get_relation_type.Table,
+            information=information,
+        )
+
+        with mock.patch.object(adapter, "get_columns_in_relation") as mock_get_cols:
+            result = list(adapter._get_columns_for_catalog(relation))
+
+        mock_get_cols.assert_not_called()
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["column_name"], "id")
+        self.assertEqual(result[1]["column_name"], "name")
+
+    def test_fallback_swallows_runtime_error(self):
+        """If the fallback get_columns_in_relation raises DbtRuntimeError"""
+        adapter = self._make_adapter()
+
+        relation = SparkRelation.create(
+            schema="default",
+            identifier="orders",
+            type=SparkRelation.get_relation_type.Table,
+            information="Provider: iceberg\n",
+        )
+
+        with mock.patch.object(
+            adapter,
+            "get_columns_in_relation",
+            side_effect=DbtRuntimeError("describe failed"),
+        ):
+            result = list(adapter._get_columns_for_catalog(relation))
+
+        self.assertEqual(result, [])
