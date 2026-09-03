@@ -140,30 +140,41 @@ else:
   {%- endmacro -%}
 
 {% macro python__partitionedBy_clause() %}
-  {% if partition_cols() -%}
-    {% set partition_cols = (partition_cols() | trim) %}
-
-    {# Remove the first character if this character is '(' #}
-    {% if partition_cols[0] == '(' %}
-      {% set partition_cols = partition_cols[1:] %}
-    {% endif %}
-
-      {# Remove the last character if this character is ')' #}
-    {% if partition_cols[-1] == ')' %}
-      {% set partition_cols = partition_cols[:-1] %}
-    {% endif %}
-
-    {% set partitions = partition_cols.split(",") %}
-    {% set partitions_quoted = [] %}
+  {% set partitions = config.get('partition_by', validator=validation.any[list, basestring]) %}
+  {% if partitions is string %}
+    {% set partitions = [partitions] %}
+  {% endif %}
+  {% if partitions is not none %}
+    {% set rendered_partitions = [] %}
     {% for partition in partitions %}
-      {% if not ((partition.startswith('years') or partition.startswith('months') or partition.startswith('days') or partition.startswith('hours') or partition.startswith('bucket') )) %}
-        {% do partitions_quoted.append("'" ~ partition ~ "'") %}
-      {% else%}
-        {% do partitions_quoted.append(partition) %}
+      {% set partition = partition | trim %}
+      {% set function = partition.split('(', 1)[0] | trim %}
+      {% if function in ('years', 'months', 'days', 'hours') %}
+        {% if not partition.endswith(')') %}
+          {{ exceptions.raise_compiler_error("Invalid partition transform '" ~ partition ~ "'") }}
+        {% endif %}
+        {% set column = partition[(function | length) + 1:-1] | trim | replace('`', '') %}
+        {% if not column %}
+          {{ exceptions.raise_compiler_error("Invalid partition transform '" ~ partition ~ "'") }}
+        {% endif %}
+        {% do rendered_partitions.append(function ~ '(' ~ (column | tojson) ~ ')') %}
+      {% elif function == 'bucket' %}
+        {% if not partition.endswith(')') %}
+          {{ exceptions.raise_compiler_error("Invalid partition transform '" ~ partition ~ "'") }}
+        {% endif %}
+        {% set arguments = partition[(function | length) + 1:-1].split(',', 1) %}
+        {% if arguments | length != 2 or not arguments[0] | trim or not arguments[1] | trim %}
+          {{ exceptions.raise_compiler_error("Invalid partition transform '" ~ partition ~ "'") }}
+        {% endif %}
+        {% set bucket_count = arguments[0] | trim %}
+        {% set column = arguments[1] | trim | replace('`', '') %}
+        {% do rendered_partitions.append('bucket(' ~ bucket_count ~ ', ' ~ (column | tojson) ~ ')') %}
+      {% else %}
+        {% do rendered_partitions.append(partition | replace('`', '') | tojson) %}
       {% endif %}
     {% endfor %}
-    {% if partitions_quoted is defined and (partitions_quoted | length) > 0 %}
-  writer = writer.partitionedBy({{ partitions_quoted | join(",") }})
+    {% if rendered_partitions | length > 0 %}
+  writer = writer.partitionedBy({{ rendered_partitions | join(",") }})
     {% endif %}
   {%- endif %}
 {%- endmacro -%}

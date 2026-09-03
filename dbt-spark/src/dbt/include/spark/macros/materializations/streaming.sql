@@ -126,12 +126,10 @@ if not {{ target_exists }}:
 
     writer = spark.createDataFrame([], {{ dataframe }}.schema).writeTo(target_name).using("{{ config.get('file_format', 'delta') }}")
 {{ python__partitionedBy_clause() | indent(4, true) }}
-    {% for option, value in (config.get('options') or {}).items() -%}
+{% for option, value in (config.get('options') or {}).items() -%}
     writer = writer.option("{{ option }}", "{{ spark__escape_single_quotes(value) }}")
-    {% endfor -%}
-    {% if location_clause() -%}
-    writer = writer.option("path", "{{ location_clause() | trim }}".split("'")[1])
-    {%- endif %}
+{% endfor -%}
+{{ python__location_clause() | trim | indent(4, true) }}
 {{ python__tblproperties_clause() | indent(4, true) }}
     writer.create()
 

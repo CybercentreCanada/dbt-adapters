@@ -50,7 +50,12 @@ def _stream_options(config):
     return template.module.spark__stream_options_clause()
 
 
-def _render_stream_table(macro_name: str, await_termination: bool = False) -> str:
+def _render_stream_table(
+    macro_name: str,
+    await_termination: bool = False,
+    location_root: str | None = None,
+    partition_by: list[str] | None = None,
+) -> str:
     environment = Environment(extensions=["jinja2.ext.do"])
     template = environment.from_string(_jinja_source())
     template.globals.update(
@@ -58,7 +63,17 @@ def _render_stream_table(macro_name: str, await_termination: bool = False) -> st
             "config": type(
                 "Config",
                 (),
-                {"get": lambda _, key, default=None: {} if key == "stream_options" else default},
+                {
+                    "get": lambda _, key, default=None: (
+                        {}
+                        if key == "stream_options"
+                        else (
+                            location_root
+                            if key == "location_root"
+                            else partition_by if key == "partition_by" else default
+                        )
+                    )
+                },
             )(),
             "adapter": type(
                 "Adapter",
@@ -78,7 +93,17 @@ def _render_stream_table(macro_name: str, await_termination: bool = False) -> st
             "env_var": lambda _, default: default,
             "location_clause": lambda: "",
             "model": type("Model", (), {"refs": [], "sources": []})(),
-            "python__partitionedBy_clause": lambda: "",
+            "python__partitionedBy_clause": lambda: (
+                'writer = writer.partitionedBy(days("ingest_loaded_by"))'
+                if partition_by == ["days(ingest_loaded_by)"]
+                else ""
+            ),
+            "python__location_clause": lambda: (
+                'target_location = "' + location_root + '/stream"\n'
+                'writer = writer.option("location", target_location)'
+                if location_root
+                else ""
+            ),
             "python__tblproperties_clause": lambda: "",
             "return": lambda value: value,
             "spark__escape_single_quotes": lambda value: value.replace("'", "\\'"),
@@ -142,6 +167,28 @@ def test_streaming_materialization_preserves_runtime_dataframe_name(macro_name, 
     assert "df.writeStream" in rendered
     assert f"if {await_termination}:" in rendered
     assert "BehaviorFlag" not in rendered
+
+
+@pytest.mark.parametrize("macro_name", ["py_stream_table", "sql_stream_table"])
+def test_streaming_materialization_uses_python_location_option(macro_name):
+    rendered = _render_stream_table(macro_name, location_root="/mnt/root")
+
+    compile(rendered, f"{macro_name}.py", "exec")
+
+    assert 'target_location = "/mnt/root/stream"' in rendered
+    assert 'writer = writer.option("location", target_location)' in rendered
+    assert 'writer = writer.option("path",' not in rendered
+    assert '.split("\'")' not in rendered
+
+
+@pytest.mark.parametrize("macro_name", ["py_stream_table", "sql_stream_table"])
+def test_streaming_materialization_quotes_partition_transform_columns(macro_name):
+    rendered = _render_stream_table(macro_name, partition_by=["days(ingest_loaded_by)"])
+
+    compile(rendered, f"{macro_name}.py", "exec")
+
+    assert 'writer = writer.partitionedBy(days("ingest_loaded_by"))' in rendered
+    assert "days(ingest_loaded_by)" not in rendered
 
 
 def test_streaming_materialization_only_waits_when_configured():

@@ -1,6 +1,7 @@
 import unittest
 from unittest import mock
 import re
+from pathlib import Path
 from jinja2 import Environment, FileSystemLoader
 
 
@@ -183,6 +184,31 @@ class TestSparkMacros(unittest.TestCase):
 
         self.assertIn('target_location = "/mnt/root/my_table"', python)
         self.assertIn('writer = writer.option("location", target_location)', python)
+
+    def test_python_partitioned_by_clause_quotes_transform_columns(self):
+        source = (
+            Path("src/dbt/include/spark/macros/materializations/table.sql")
+            .read_text()
+            .replace(
+                "{% materialization table, adapter = 'spark', supported_languages=['sql', 'python'] %}",
+                "{% macro table() %}",
+            )
+            .replace("{% endmaterialization %}", "{% endmacro %}")
+        )
+        template = self.jinja_env.from_string(source, globals=self.default_context)
+
+        self.config["partition_by"] = [
+            "region",
+            "days(ingest_loaded_by)",
+            "months(`created_at`)",
+            "bucket(16, user_id)",
+        ]
+        python = template.module.python__partitionedBy_clause()
+
+        self.assertIn(
+            'writer = writer.partitionedBy("region",days("ingest_loaded_by"),months("created_at"),bucket(16, "user_id"))',
+            python,
+        )
 
     def test_macros_create_table_as_comment(self):
         template = self.__get_template("adapters.sql")

@@ -45,7 +45,7 @@
 {% macro python__location_clause() %}
   {%- set location_root = config.get('location_root', validator=validation.any[basestring]) -%}
   {%- set identifier = model['alias'] -%}
-  {%- if location_root is not none %}
+  {%- if location_root is not none -%}
 target_location = {{ (location_root ~ '/' ~ identifier) | tojson }}
 writer = writer.option("location", target_location)
   {%- elif adapter.behavior.require_location_root %}
