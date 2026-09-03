@@ -55,6 +55,7 @@ def _render_stream_table(
     await_termination: bool = False,
     location_root: str | None = None,
     partition_by: list[str] | None = None,
+    tblproperties: dict[str, str] | None = None,
 ) -> str:
     environment = Environment(extensions=["jinja2.ext.do"])
     template = environment.from_string(_jinja_source())
@@ -70,7 +71,11 @@ def _render_stream_table(
                         else (
                             location_root
                             if key == "location_root"
-                            else partition_by if key == "partition_by" else default
+                            else (
+                                partition_by
+                                if key == "partition_by"
+                                else tblproperties if key == "tblproperties" else default
+                            )
                         )
                     )
                 },
@@ -94,7 +99,7 @@ def _render_stream_table(
             "location_clause": lambda: "",
             "model": type("Model", (), {"refs": [], "sources": []})(),
             "python__partitionedBy_clause": lambda: (
-                'writer = writer.partitionedBy(days("ingest_loaded_by"))'
+                '  writer = writer.partitionedBy(days("ingest_loaded_by"))'
                 if partition_by == ["days(ingest_loaded_by)"]
                 else ""
             ),
@@ -104,7 +109,11 @@ def _render_stream_table(
                 if location_root
                 else ""
             ),
-            "python__tblproperties_clause": lambda: "",
+            "python__tblproperties_clause": lambda: (
+                '  writer = writer.tableProperty("owner", "analytics")'
+                if tblproperties == {"owner": "analytics"}
+                else ""
+            ),
             "return": lambda value: value,
             "spark__escape_single_quotes": lambda value: value.replace("'", "\\'"),
             "spark__stream_options_clause": lambda: "",
@@ -189,6 +198,20 @@ def test_streaming_materialization_quotes_partition_transform_columns(macro_name
 
     assert 'writer = writer.partitionedBy(days("ingest_loaded_by"))' in rendered
     assert "days(ingest_loaded_by)" not in rendered
+
+
+@pytest.mark.parametrize("macro_name", ["py_stream_table", "sql_stream_table"])
+def test_streaming_materialization_indents_shared_writer_helpers(macro_name):
+    rendered = _render_stream_table(
+        macro_name,
+        partition_by=["days(ingest_loaded_by)"],
+        tblproperties={"owner": "analytics"},
+    )
+
+    compile(rendered, f"{macro_name}.py", "exec")
+
+    assert '        writer = writer.partitionedBy(days("ingest_loaded_by"))' in rendered
+    assert '        writer = writer.tableProperty("owner", "analytics")' in rendered
 
 
 def test_streaming_materialization_only_waits_when_configured():

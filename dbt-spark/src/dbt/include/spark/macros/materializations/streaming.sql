@@ -125,12 +125,12 @@ if not {{ target_exists }}:
     from pyspark.sql.functions import years, months, days, hours, bucket
 
     writer = spark.createDataFrame([], {{ dataframe }}.schema).writeTo(target_name).using("{{ config.get('file_format', 'delta') }}")
-{{ python__partitionedBy_clause() | indent(4, true) }}
+{{ python__partitionedBy_clause() | indent(2, true) }}
 {% for option, value in (config.get('options') or {}).items() -%}
     writer = writer.option("{{ option }}", "{{ spark__escape_single_quotes(value) }}")
 {% endfor -%}
 {{ python__location_clause() | trim | indent(4, true) }}
-{{ python__tblproperties_clause() | indent(4, true) }}
+{{ python__tblproperties_clause() | indent(2, true) }}
     writer.create()
 
 checkpoint_basedir = "{{ config.get('checkpoint_basedir') or env_var('DBT_STREAMING_CHECKPOINT_BASEDIR', 'tmp/dbt-streaming-checkpoints') }}"

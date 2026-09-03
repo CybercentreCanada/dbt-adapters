@@ -58,7 +58,9 @@ def _jinja_source() -> str:
     return source.replace("{% endmaterialization %}", "{% endmacro %}")
 
 
-def _render_streaming_model(target_name: str, checkpoint_basedir: Path) -> str:
+def _render_streaming_model(
+    target_name: str, checkpoint_basedir: Path, partition_by: list[str] | None = None
+) -> str:
     template = Environment(extensions=["jinja2.ext.do"]).from_string(_jinja_source())
     template.globals.update(
         {
@@ -66,6 +68,7 @@ def _render_streaming_model(target_name: str, checkpoint_basedir: Path) -> str:
                 {
                     "file_format": "iceberg",
                     "checkpoint_basedir": str(checkpoint_basedir),
+                    "partition_by": partition_by,
                     "trigger": "1 second",
                     "stream_options": {},
                 }
@@ -77,7 +80,12 @@ def _render_streaming_model(target_name: str, checkpoint_basedir: Path) -> str:
             )(),
             "env_var": lambda _, default: default,
             "location_clause": lambda: "",
-            "python__partitionedBy_clause": lambda: "",
+            "python__partitionedBy_clause": lambda: (
+                '  writer = writer.partitionedBy(days("timestamp"))'
+                if partition_by == ["days(timestamp)"]
+                else ""
+            ),
+            "python__location_clause": lambda: "",
             "python__tblproperties_clause": lambda: "",
             "return": lambda value: value,
             "spark__escape_single_quotes": lambda value: value.replace("'", "\\'"),
@@ -90,6 +98,22 @@ def _render_streaming_model(target_name: str, checkpoint_basedir: Path) -> str:
     return template.module.py_stream_table(compiled_code, target_name, False)
 
 
+@pytest.mark.parametrize("partition_by", [None, ["days(timestamp)"]])
+def test_streaming_materialization_live_template_renders_without_location_root(
+    tmp_path, partition_by
+):
+    rendered = _render_streaming_model(
+        "test_catalog.default.streaming_test", tmp_path, partition_by
+    )
+
+    compile(rendered, "streaming_model.py", "exec")
+
+    assert 'writer = writer.option("path",' not in rendered
+    assert '.split("\'")' not in rendered
+    if partition_by:
+        assert '        writer = writer.partitionedBy(days("timestamp"))' in rendered
+
+
 def _wait_for_rows(spark: SparkSession, target_name: str, timeout_seconds: int = 30) -> None:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
@@ -100,6 +124,37 @@ def _wait_for_rows(spark: SparkSession, target_name: str, timeout_seconds: int =
             pass
         time.sleep(0.2)
     pytest.fail(f"No rows were committed to {target_name} within {timeout_seconds} seconds")
+
+
+def _table_partition_spec(spark: SparkSession, target_name: str) -> list[str]:
+    ddl = spark.sql(f"SHOW CREATE TABLE {target_name}").first()[0]
+    match = re.search(
+        r"PARTITIONED\s+BY\s*\((.+?)\)\s*(?:TBLPROPERTIES|LOCATION|OPTIONS|COMMENT|$)",
+        ddl,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if match is None:
+        return []
+
+    partitions = []
+    depth = 0
+    current = []
+    for character in match.group(1).strip():
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+        if character == "," and depth == 0:
+            partitions.append("".join(current))
+            current = []
+        else:
+            current.append(character)
+    if current:
+        partitions.append("".join(current))
+
+    return [
+        re.sub(r"\s+", " ", partition.replace("`", "")).strip().lower() for partition in partitions
+    ]
 
 
 @pytest.fixture
@@ -155,3 +210,22 @@ def test_streaming_materialization_starts_and_reuses_local_iceberg_stream(spark,
 
     active_query.stop()
     assert active_query.awaitTermination(10)
+
+
+def test_streaming_materialization_creates_partitioned_local_iceberg_stream(spark, tmp_path):
+    target_name = f"test_catalog.default.streaming_{uuid.uuid4().hex}"
+    rendered = _render_streaming_model(
+        target_name, tmp_path / "checkpoints", partition_by=["days(timestamp)"]
+    )
+    namespace = {"dbtObj": _Dbt, "spark": spark}
+
+    assert 'writer = writer.partitionedBy(days("timestamp"))' in rendered
+
+    exec(compile(rendered, "streaming_partitioned_model.py", "exec"), namespace)
+    active_query = next(query for query in spark.streams.active if query.name == target_name)
+    try:
+        _wait_for_rows(spark, target_name)
+        assert _table_partition_spec(spark, target_name) == ["days(timestamp)"]
+    finally:
+        active_query.stop()
+        active_query.awaitTermination(10)
