@@ -1,4 +1,4 @@
-{% materialization streaming, adapter='spark', supported_languages=['python'] %}
+{% materialization streaming, adapter='spark', supported_languages=['sql', 'python'] %}
   {%- set language = model['language'] -%}
   {%- set identifier = model['alias'] -%}
   {%- set grant_config = config.get('grants') -%}
@@ -19,8 +19,13 @@
     {% do sync_tblproperties(target_relation, config.get('tblproperties')) %}
   {%- endif -%}
 
-  {%- call statement('main', language=language) -%}
-    {{ py_stream_table(compiled_code, target_relation, old_relation is not none) }}
+    {%- set execution_language = 'python' if language == 'sql' else language -%}
+    {%- call statement('main', language=execution_language) -%}
+        {% if language == 'sql' %}
+            {{ sql_stream_table(compiled_code, target_relation, old_relation is not none) }}
+        {% else %}
+            {{ py_stream_table(compiled_code, target_relation, old_relation is not none) }}
+        {% endif %}
   {%- endcall -%}
 
   {% set should_revoke = should_revoke(old_relation, full_refresh_mode=True) %}
@@ -52,40 +57,7 @@ if active_query is None:
     dbt = dbtObj(load_df_from_table_or_sql)
     df = model(dbt, spark)
 
-    if not isinstance(df, pyspark.sql.dataframe.DataFrame):
-        raise TypeError(f"{type(df)} is not a supported type for dbt Python streaming materialization")
-    if not df.isStreaming:
-        raise TypeError("dbt Python streaming models must return a streaming PySpark DataFrame")
-
-    if not {{ target_exists }}:
-        from pyspark.sql.functions import years, months, days, hours, bucket
-
-        writer = spark.createDataFrame([], df.schema).writeTo(target_name).using("{{ config.get('file_format', 'delta') }}")
-        {{ python__partitionedBy_clause() | indent(8, true) }}
-        {% for option, value in (config.get('options') or {}).items() -%}
-        writer = writer.option("{{ option }}", "{{ spark__escape_single_quotes(value) }}")
-        {% endfor -%}
-        {% if location_clause() -%}
-        writer = writer.option("path", "{{ location_clause() | trim }}".split("'")[1])
-        {%- endif %}
-        {{ python__tblproperties_clause() | indent(8, true) }}
-        writer.create()
-
-    checkpoint_basedir = "{{ config.get('checkpoint_basedir') or env_var('DBT_STREAMING_CHECKPOINT_BASEDIR', 'tmp/dbt-streaming-checkpoints') }}"
-    if not checkpoint_basedir or checkpoint_basedir == "None":
-        raise ValueError("checkpoint_basedir must be configured")
-    checkpoint_location = f"{checkpoint_basedir}/{target_name}"
-    trigger = "{{ config.get('trigger') or env_var('DBT_STREAMING_TRIGGER', '60 seconds') }}"
-
-    active_query = (
-        df.writeStream
-        .queryName(target_name)
-        .option("checkpointLocation", checkpoint_location)
-        {{ spark__stream_options_clause() | indent(8, true) }}
-        .trigger(processingTime=trigger)
-        .toTable(target_name)
-    )
-    print(f"Started stream {target_name} (id={active_query.id}, checkpoint={checkpoint_location})")
+    {{ start_stream(df, target_exists) | indent(4, true) }}
 else:
     print(f"Stream {target_name} is already active (id={active_query.id}); skipping startup. Changed stream_options take effect after the stream is restarted.")
 
@@ -95,6 +67,89 @@ else:
 {% endif %}
 if {{ await_termination }}:
     active_query.awaitTermination()
+{% endmacro %}
+
+
+{% macro sql_stream_table(compiled_code, target_relation, target_exists) %}
+import pyspark
+from dbt.adapters.spark.sql_rewrite import rewrite_streaming_sql
+
+target_name = "{{ target_relation }}"
+active_query = next((query for query in spark.streams.active if query.name == target_name), None)
+
+if active_query is None:
+        stream_inputs = {
+            {%- set input_index = namespace(value=0) -%}
+            {%- for ref_node in model.refs -%}
+                {%- set ref_args = [ref_node.get('package'), ref_node['name']] if ref_node.get('package') else [ref_node['name']] -%}
+                {%- set resolved = ref(*ref_args, v=ref_node.get('version')) -%}
+                {%- if resolved.render is defined and resolved.render is callable -%}
+                    {%- set resolved = resolved.render() -%}
+                {%- endif -%}
+                "{{ resolved }}": "__dbt_stream_input_{{ input_index.value }}",
+                {%- set input_index.value = input_index.value + 1 -%}
+            {%- endfor -%}
+            {%- for source_node in model.sources -%}
+                {%- set resolved = source(*source_node) -%}
+                {%- if resolved.render is defined and resolved.render is callable -%}
+                    {%- set resolved = resolved.render() -%}
+                {%- endif -%}
+                "{{ resolved }}": "__dbt_stream_input_{{ input_index.value }}",
+                {%- set input_index.value = input_index.value + 1 -%}
+            {%- endfor -%}
+        }
+        for relation, temporary_view in stream_inputs.items():
+                spark.readStream.table(relation).createOrReplaceTempView(temporary_view)
+
+        df = spark.sql(rewrite_streaming_sql({{ compiled_code | tojson }}, stream_inputs))
+        {{ start_stream(df, target_exists) | indent(4, true) }}
+else:
+        print(f"Stream {target_name} is already active (id={active_query.id}); skipping startup. Changed stream_options take effect after the stream is restarted.")
+
+{% set await_termination = config.get('await_termination') %}
+{% if await_termination is none %}
+{% set await_termination = adapter.behavior.await_termination %}
+{% endif %}
+if {{ await_termination }}:
+        active_query.awaitTermination()
+{% endmacro %}
+
+
+{% macro start_stream(dataframe, target_exists) %}
+if not isinstance({{ dataframe }}, pyspark.sql.dataframe.DataFrame):
+        raise TypeError(f"{type({{ dataframe }})} is not a supported type for dbt streaming materialization")
+if not {{ dataframe }}.isStreaming:
+        raise TypeError("dbt streaming models must produce a streaming PySpark DataFrame")
+
+if not {{ target_exists }}:
+        from pyspark.sql.functions import years, months, days, hours, bucket
+
+        writer = spark.createDataFrame([], {{ dataframe }}.schema).writeTo(target_name).using("{{ config.get('file_format', 'delta') }}")
+        {{ python__partitionedBy_clause() | indent(4, true) }}
+        {% for option, value in (config.get('options') or {}).items() -%}
+        writer = writer.option("{{ option }}", "{{ spark__escape_single_quotes(value) }}")
+        {% endfor -%}
+        {% if location_clause() -%}
+        writer = writer.option("path", "{{ location_clause() | trim }}".split("'")[1])
+        {%- endif %}
+        {{ python__tblproperties_clause() | indent(4, true) }}
+        writer.create()
+
+checkpoint_basedir = "{{ config.get('checkpoint_basedir') or env_var('DBT_STREAMING_CHECKPOINT_BASEDIR', 'tmp/dbt-streaming-checkpoints') }}"
+if not checkpoint_basedir or checkpoint_basedir == "None":
+        raise ValueError("checkpoint_basedir must be configured")
+checkpoint_location = f"{checkpoint_basedir}/{target_name}"
+trigger = "{{ config.get('trigger') or env_var('DBT_STREAMING_TRIGGER', '60 seconds') }}"
+
+active_query = (
+        {{ dataframe }}.writeStream
+        .queryName(target_name)
+        .option("checkpointLocation", checkpoint_location)
+        {{ spark__stream_options_clause() | indent(4, true) }}
+        .trigger(processingTime=trigger)
+        .toTable(target_name)
+)
+print(f"Started stream {target_name} (id={active_query.id}, checkpoint={checkpoint_location})")
 {% endmacro %}
 
 

@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 from jinja2 import Environment
 
+from dbt.adapters.spark.sql_rewrite import rewrite_streaming_sql
 
 STREAMING_TEMPLATE = (
     Path(__file__).parents[2] / "src/dbt/include/spark/macros/materializations/streaming.sql"
@@ -13,6 +14,14 @@ STREAMING_TEMPLATE = (
 
 def _source() -> str:
     return STREAMING_TEMPLATE.read_text()
+
+
+def _jinja_source() -> str:
+    source = _source().replace(
+        "{% materialization streaming, adapter='spark', supported_languages=['sql', 'python'] %}",
+        "{% macro streaming() %}",
+    )
+    return source.replace("{% endmaterialization %}", "{% endmacro %}")
 
 
 class _CompilerError(Exception):
@@ -25,12 +34,7 @@ def _raise_compiler_error(message):
 
 def _stream_options(config):
     environment = Environment(extensions=["jinja2.ext.do"])
-    source = _source().replace(
-        "{% materialization streaming, adapter='spark', supported_languages=['python'] %}",
-        "{% macro streaming() %}",
-    )
-    source = source.replace("{% endmaterialization %}", "{% endmacro %}")
-    template = environment.from_string(source)
+    template = environment.from_string(_jinja_source())
     template.globals.update(
         {
             "config": type(
@@ -47,20 +51,16 @@ def _stream_options(config):
 
 
 def test_streaming_materialization_template_parses():
-    source = _source().replace(
-        "{% materialization streaming, adapter='spark', supported_languages=['python'] %}",
-        "{% macro streaming() %}",
-    )
-    source = source.replace("{% endmaterialization %}", "{% endmacro %}")
-
-    Environment(extensions=["jinja2.ext.do"]).parse(source)
+    Environment(extensions=["jinja2.ext.do"]).parse(_jinja_source())
 
 
-def test_streaming_materialization_is_local_session_python_only():
+def test_streaming_materialization_is_local_session_only():
     source = _source()
 
-    assert "supported_languages=['python']" in source
+    assert "supported_languages=['sql', 'python']" in source
     assert "submission_method='spark_session_based_cluster'" in source
+    assert "statement('main', language=execution_language)" in source
+    assert "sql_stream_table(compiled_code, target_relation" in source
 
 
 def test_streaming_materialization_reuses_active_query_before_model_execution():
@@ -77,7 +77,7 @@ def test_streaming_materialization_reuses_active_query_before_model_execution():
 def test_streaming_materialization_creates_v2_sink_and_syncs_metadata():
     source = _source()
 
-    assert "spark.createDataFrame([], df.schema).writeTo(target_name)" in source
+    assert "spark.createDataFrame([], {{ dataframe }}.schema).writeTo(target_name)" in source
     assert ".using(\"{{ config.get('file_format', 'delta') }}\")" in source
     assert "python__partitionedBy_clause" in source
     assert "python__tblproperties_clause" in source
@@ -111,7 +111,9 @@ def test_stream_options_render_on_data_stream_writer():
     assert '.option("check-nullability", "true")' in rendered
     assert '.option("check-ordering", "false")' in rendered
     assert '.option("snapshot-property.app-id", "my_supervisor_v1")' in rendered
-    assert _source().index("spark__stream_options_clause") > _source().index("df.writeStream")
+    assert _source().index("spark__stream_options_clause") > _source().index(
+        "{{ dataframe }}.writeStream"
+    )
 
 
 @pytest.mark.parametrize(
@@ -130,3 +132,45 @@ def test_stream_options_render_on_data_stream_writer():
 def test_stream_options_reject_invalid_configuration(config, message):
     with pytest.raises(_CompilerError, match=message):
         _stream_options(config)
+
+
+def test_rewrite_streaming_sql_replaces_only_table_references():
+    sql = """
+        -- analytics.events must stay in this comment
+        select event_id, 'analytics.events' as source_name
+        from analytics.events as events
+        join raw.clicks as clicks on events.event_id = clicks.event_id
+    """
+
+    rewritten = rewrite_streaming_sql(
+        sql,
+        {
+            "analytics.events": "__dbt_stream_input_0",
+            "raw.clicks": "__dbt_stream_input_1",
+        },
+    )
+
+    assert "FROM __dbt_stream_input_0 AS events" in rewritten
+    assert "JOIN __dbt_stream_input_1 AS clicks" in rewritten
+    assert "'analytics.events' AS source_name" in rewritten
+    assert "analytics.events must stay in this comment" in rewritten
+
+
+def test_rewrite_streaming_sql_rejects_unmatched_input():
+    with pytest.raises(RuntimeError, match="did not reference"):
+        rewrite_streaming_sql("select * from analytics.events", {"raw.clicks": "input"})
+
+
+def test_rewrite_streaming_sql_preserves_ctes_and_quoted_relation_aliases():
+    rewritten = rewrite_streaming_sql(
+        """
+        with events as (
+            select * from `analytics`.`raw events` as source_events
+        )
+        select * from events
+        """,
+        {"`analytics`.`raw events`": "__dbt_stream_input_0"},
+    )
+
+    assert "WITH events AS (SELECT * FROM __dbt_stream_input_0 AS source_events)" in rewritten
+    assert "SELECT * FROM events" in rewritten

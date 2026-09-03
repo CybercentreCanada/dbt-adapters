@@ -311,6 +311,136 @@ models:
   may overlap them; do not assume single-writer semantics for any batch
   unless `+concurrent_batches: false` is set.
 
+### Streaming Materialization (SQL and Python)
+
+The `streaming` materialization starts a Spark Structured Streaming query that
+writes to a persistent sink table. It supports SQL and Python models and
+requires the local Spark driver submission method:
+
+```yaml
+models:
+  my_project:
+    +submission_method: spark_session_based_cluster
+```
+
+dbt assigns each query the target relation name and derives a stable checkpoint
+child directory from that target. On a later dbt run, an active query with the
+same target name is reused: dbt reconciles supported table metadata but does
+not evaluate the model or start another writer.
+
+**Python example**
+
+```python
+def model(dbt, spark):
+    dbt.config(
+        materialized="streaming",
+        submission_method="spark_session_based_cluster",
+        file_format="iceberg",
+        checkpoint_basedir="s3://my-bucket/dbt-checkpoints",
+        trigger="30 seconds",
+        partition_by=["days(event_time)"],
+        tblproperties={"write.format.default": "parquet"},
+        stream_options={
+            "fanout-enabled": "true",
+            "snapshot-property.app-id": "my_supervisor_v1",
+        },
+    )
+
+    return spark.readStream.table("raw.events")
+```
+
+**SQL example**
+
+```sql
+{{ config(
+    materialized="streaming",
+    submission_method="spark_session_based_cluster",
+    file_format="iceberg",
+    checkpoint_basedir="s3://my-bucket/dbt-checkpoints",
+    trigger="30 seconds"
+) }}
+
+select
+    events.event_id,
+    events.event_time,
+    users.plan
+from {{ ref("events") }} as events
+join {{ source("raw", "users") }} as users
+    on events.user_id = users.user_id
+```
+
+For SQL streaming models, dbt resolves every declared `ref()` and `source()` as
+a Structured Streaming input with `spark.readStream.table()`, creates an
+internal temporary view for it, and runs the compiled SQL against those views.
+Every referenced model and source must therefore support Structured Streaming
+reads. Batch dimension or lookup joins are not supported by this materialization.
+
+**Streaming model config**
+
+| Config | Default | Description |
+|--------|---------|-------------|
+| `submission_method` | Required | Must be `spark_session_based_cluster`. |
+| `file_format` | `delta` | Sink table file format. Use `iceberg` for `tblproperties` sync and `stream_options`. |
+| `checkpoint_basedir` | `DBT_STREAMING_CHECKPOINT_BASEDIR`, then `tmp/dbt-streaming-checkpoints` | Parent directory for the target-specific checkpoint. It must be stable and writable by Spark. |
+| `trigger` | `DBT_STREAMING_TRIGGER`, then `60 seconds` | Structured Streaming processing-time trigger. |
+| `await_termination` | `await_termination` behavior flag | Model-level override for whether dbt waits for the started query. |
+| `partition_by` | None | Sink-table partition columns or Iceberg partition transforms. |
+| `location_root` | None | Parent location for the sink table, subject to `require_location_root`. |
+| `options` | None | Data-source options used when dbt first creates the sink table with DataFrameWriterV2. |
+| `tblproperties` | None | Iceberg sink-table properties. Existing Iceberg table properties are reconciled on reruns. |
+| `stream_options` | None | Iceberg streaming-writer options applied when dbt starts a new query. |
+
+**Wait for termination**
+
+By default, dbt starts the stream and returns without waiting. Set the
+`await_termination` behavior flag to make dbt call
+`StreamingQuery.awaitTermination()` for streaming models. A model-level
+`await_termination` config takes precedence over the flag.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `await_termination` | `false` | Wait for a streaming query to terminate before the dbt run completes. |
+
+```yaml
+flags:
+  await_termination: true
+```
+
+**Iceberg streaming writer options**
+
+`stream_options` is valid only when `file_format: iceberg`. Values must be
+strings; use the literal strings `"true"` and `"false"` rather than YAML boolean
+values. Unsupported option names, non-string values, and non-Iceberg usage raise
+a compiler error.
+
+| Option | Values | Default | Description |
+|--------|--------|---------|-------------|
+| `fanout-enabled` | `"true"`, `"false"` | `"false"` | Enables fanout writes. This permits multiple unsorted partition files to be written simultaneously, increasing memory use while avoiding a pre-write shuffle. |
+| `check-nullability` | `"true"`, `"false"` | `"true"` | Validates incoming record nulls against the target Iceberg schema. |
+| `check-ordering` | `"true"`, `"false"` | `"true"` | Validates incoming batch data against defined target-table sort orders. |
+| `snapshot-property.<key>` | String | None | Adds custom metadata to every Iceberg snapshot committed by a streaming micro-batch. |
+
+```yaml
+models:
+  my_project:
+    streaming_events:
+      +stream_options:
+        fanout-enabled: "true"
+        check-nullability: "true"
+        check-ordering: "false"
+        snapshot-property.app-id: my_supervisor_v1
+```
+
+**Operational limitations**
+
+- Only `spark_session_based_cluster` is supported; job-cluster and remote
+  submission methods cannot manage persistent local streaming queries.
+- dbt does not stop or restart an active stream. Updated `stream_options` take
+  effect only after the current query is stopped and dbt starts a new one.
+- SQL model relation references are rewritten with SQLGlot, preserving aliases,
+  CTEs, string literals, and comments while substituting the internal streaming
+  temporary views.
+
 ## Contribute
 
 - Want to help us build `dbt-spark`? Check out the [Contributing Guide](CONTRIBUTING.md).
