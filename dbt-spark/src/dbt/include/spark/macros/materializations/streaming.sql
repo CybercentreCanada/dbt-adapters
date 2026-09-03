@@ -209,5 +209,5 @@ print(f"Started stream {target_name} (id={active_query.id}, checkpoint={checkpoi
             {{ exceptions.raise_compiler_error("read_stream_options '" ~ option ~ "' must be a numeric string") }}
         {%- endif -%}
         {{ reader }} = {{ reader }}.option("{{ option }}", "{{ spark__escape_single_quotes(value) }}")
-    {%- endfor -%}
+    {% endfor %}
 {% endmacro %}

@@ -236,6 +236,26 @@ def test_streaming_materialization_applies_read_stream_options_before_table(macr
     assert rendered.index(option) < rendered.index(table)
 
 
+@pytest.mark.parametrize(
+    ("macro_name", "reader_indent"),
+    [("py_stream_table", "        "), ("sql_stream_table", "        ")],
+)
+def test_streaming_materialization_renders_read_stream_options_on_separate_lines(
+    macro_name, reader_indent
+):
+    read_stream_options = {
+        "split-size": "8388608",
+        "streaming-skip-delete-snapshots": "true",
+        "startingVersion": "latest",
+    }
+    rendered = _render_stream_table(macro_name, read_stream_options=read_stream_options)
+
+    compile(rendered, f"{macro_name}.py", "exec")
+
+    for option, value in read_stream_options.items():
+        assert f'\n{reader_indent}reader = reader.option("{option}", "{value}")\n' in rendered
+
+
 def test_streaming_materialization_only_waits_when_configured():
     source = _source()
 
