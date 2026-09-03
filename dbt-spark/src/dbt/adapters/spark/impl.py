@@ -164,6 +164,7 @@ class SparkConfig(AdapterConfig):
     await_termination: Optional[bool] = None
     checkpoint_basedir: Optional[str] = None
     trigger: Optional[str] = None
+    stream_options: Optional[Dict[str, str]] = None
 
 
 class SparkAdapter(SQLAdapter):
