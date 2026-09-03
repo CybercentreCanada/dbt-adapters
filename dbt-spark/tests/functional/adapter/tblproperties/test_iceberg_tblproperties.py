@@ -10,7 +10,7 @@ They validate that:
 
 import pytest
 
-from dbt.tests.util import run_dbt, get_connection, relation_from_name
+from dbt.tests.util import run_dbt, relation_from_name
 
 
 _MODEL_CREATE = """
@@ -69,6 +69,19 @@ _MODEL_UPDATE_PROPERTY = """
 select 1 as id
 """
 
+_MODEL_OVERRIDE_PROJECT = """
+{{
+    config(
+        materialized='incremental',
+        file_format='iceberg',
+        tblproperties={
+            'write.format.default': 'avro'
+        }
+    )
+}}
+select 1 as id
+"""
+
 
 def _get_tblproperties(project, model_name):
     """Fetch tblproperties from the catalog for a given model."""
@@ -90,6 +103,31 @@ class TestIcebergTblpropertiesCreate:
         props = _get_tblproperties(project, "my_model")
         assert props.get("write.format.default") == "parquet"
         assert props.get("history.expire.max-snapshot-age-ms") == "86400000"
+
+
+class TestIcebergTblpropertiesProjectOverride:
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {"my_model.sql": _MODEL_OVERRIDE_PROJECT}
+
+    @pytest.fixture(scope="class")
+    def project_config_update(self):
+        return {
+            "models": {
+                "+file_format": "iceberg",
+                "+tblproperties": {
+                    "write.format.default": "parquet",
+                    "history.expire.max-snapshot-age-ms": "86400000",
+                },
+            }
+        }
+
+    def test_model_tblproperties_overwrite_project_defaults(self, project):
+        run_dbt(["run"])
+        props = _get_tblproperties(project, "my_model")
+
+        assert props.get("write.format.default") == "avro"
+        assert "history.expire.max-snapshot-age-ms" not in props
 
 
 class TestIcebergTblpropertiesAddProperty:
