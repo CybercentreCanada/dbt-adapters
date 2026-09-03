@@ -1,4 +1,5 @@
 {% materialization incremental, adapter='spark', supported_languages=['sql', 'python'] -%}
+  {% do spark__validate_streaming_options_config('incremental') %}
   {#-- Validate early so we don't run SQL if the file_format + strategy combo is invalid --#}
   {%- set raw_file_format = config.get('file_format', default='parquet') -%}
   {%- set raw_strategy = config.get('incremental_strategy') or 'append' -%}

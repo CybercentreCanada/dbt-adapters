@@ -88,6 +88,8 @@
 
 {% materialization snapshot, adapter='spark' %}
 
+  {% do spark__validate_streaming_options_config('snapshot') %}
+
   {%- set target_table = model.get('alias', model.get('name')) -%}
 
   {%- set strategy_name = config.get('strategy') -%}

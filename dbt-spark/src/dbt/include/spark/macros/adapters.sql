@@ -32,6 +32,14 @@
   {{ return(adapter.dispatch('location_clause', 'dbt')()) }}
 {%- endmacro -%}
 
+{% macro spark__validate_streaming_options_config(materialization) %}
+  {%- for option_name in ('read_stream_options', 'write_stream_options') -%}
+    {%- if config.get(option_name) is not none -%}
+      {{ exceptions.raise_compiler_error("'" ~ option_name ~ "' is only supported for materialized='streaming'; remove it from this " ~ materialization ~ " model.") }}
+    {%- endif -%}
+  {%- endfor -%}
+{% endmacro %}
+
 {% macro spark__location_clause() %}
   {%- set location_root = config.get('location_root', validator=validation.any[basestring]) -%}
   {%- set identifier = model['alias'] -%}

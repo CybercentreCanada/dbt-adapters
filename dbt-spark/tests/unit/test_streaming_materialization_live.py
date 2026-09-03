@@ -70,7 +70,9 @@ def _render_streaming_model(
                     "checkpoint_basedir": str(checkpoint_basedir),
                     "partition_by": partition_by,
                     "trigger": "1 second",
-                    "stream_options": {},
+                    "stream_options": None,
+                    "read_stream_options": {},
+                    "write_stream_options": {},
                 }
             ),
             "adapter": type(
@@ -79,6 +81,15 @@ def _render_streaming_model(
                 {"behavior": type("Behavior", (), {"await_termination": _BehaviorFlag()})()},
             )(),
             "env_var": lambda _, default: default,
+            "exceptions": type(
+                "Exceptions",
+                (),
+                {
+                    "raise_compiler_error": staticmethod(
+                        lambda message: (_ for _ in ()).throw(ValueError(message))
+                    )
+                },
+            )(),
             "location_clause": lambda: "",
             "python__partitionedBy_clause": lambda: (
                 '  writer = writer.partitionedBy(days("timestamp"))'

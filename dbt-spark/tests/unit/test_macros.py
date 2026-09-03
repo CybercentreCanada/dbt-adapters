@@ -47,6 +47,48 @@ class TestSparkMacros(unittest.TestCase):
     def test_macros_load(self):
         self.jinja_env.get_template("adapters.sql")
 
+    def test_table_rejects_streaming_only_options(self):
+        source = (
+            Path("src/dbt/include/spark/macros/materializations/table.sql")
+            .read_text()
+            .replace(
+                "{% materialization table, adapter = 'spark', supported_languages=['sql', 'python'] %}",
+                "{% macro table() %}",
+            )
+            .replace("{% endmaterialization %}", "{% endmacro %}")
+        )
+        environment = Environment(extensions=["jinja2.ext.do"])
+        template = environment.from_string(source)
+
+        def raise_compiler_error(message):
+            raise ValueError(message)
+
+        template.globals.update(
+            {
+                "config": type(
+                    "Config",
+                    (),
+                    {
+                        "get": lambda _, key, default=None, **kwargs: (
+                            {"fanout-enabled": "true"}
+                            if key == "write_stream_options"
+                            else default
+                        )
+                    },
+                )(),
+                "exceptions": type(
+                    "Exceptions", (), {"raise_compiler_error": staticmethod(raise_compiler_error)}
+                )(),
+                "spark__validate_streaming_options_config": lambda materialization: raise_compiler_error(
+                    "'write_stream_options' is only supported for materialized='streaming'; "
+                    f"remove it from this {materialization} model."
+                ),
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "materialized='streaming'"):
+            template.module.table()
+
     def test_macros_create_table_as(self):
         template = self.__get_template("adapters.sql")
         sql = self.__run_macro(

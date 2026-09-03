@@ -340,7 +340,7 @@ def model(dbt, spark):
         trigger="30 seconds",
         partition_by=["days(event_time)"],
         tblproperties={"write.format.default": "parquet"},
-        stream_options={
+        write_stream_options={
             "fanout-enabled": "true",
             "snapshot-property.app-id": "my_supervisor_v1",
         },
@@ -380,7 +380,7 @@ reads. Batch dimension or lookup joins are not supported by this materialization
 | Config | Default | Description |
 |--------|---------|-------------|
 | `submission_method` | Required | Must be `spark_session_based_cluster`. |
-| `file_format` | `delta` | Sink table file format. Use `iceberg` for `tblproperties` sync and `stream_options`. |
+| `file_format` | `delta` | Sink table file format. Use `iceberg` for `tblproperties` sync and `write_stream_options`. |
 | `checkpoint_basedir` | `DBT_STREAMING_CHECKPOINT_BASEDIR`, then `tmp/dbt-streaming-checkpoints` | Parent directory for the target-specific checkpoint. It must be stable and writable by Spark. |
 | `trigger` | `DBT_STREAMING_TRIGGER`, then `60 seconds` | Structured Streaming processing-time trigger. |
 | `await_termination` | `await_termination` behavior flag | Model-level override for whether dbt waits for the started query. |
@@ -388,7 +388,8 @@ reads. Batch dimension or lookup joins are not supported by this materialization
 | `location_root` | None | Parent location for the sink table, subject to `require_location_root`. |
 | `options` | None | Data-source options used when dbt first creates the sink table with DataFrameWriterV2. |
 | `tblproperties` | None | Iceberg sink-table properties. Existing Iceberg table properties are reconciled on reruns. |
-| `stream_options` | None | Iceberg streaming-writer options applied when dbt starts a new query. |
+| `write_stream_options` | None | Iceberg streaming-writer options applied when dbt starts a new query. |
+| `read_stream_options` | None | Iceberg streaming-reader options applied to every dbt-managed `ref()` and `source()` input. |
 
 **Wait for termination**
 
@@ -420,10 +421,10 @@ This test is intentionally separate from the standard unit-test command.
 
 **Iceberg streaming writer options**
 
-`stream_options` is valid only when `file_format: iceberg`. Values must be
+`write_stream_options` is valid only when `file_format: iceberg`. Values must be
 strings; use the literal strings `"true"` and `"false"` rather than YAML boolean
 values. Unsupported option names, non-string values, and non-Iceberg usage raise
-a compiler error.
+a compiler error. This config is supported only by `materialized: streaming`.
 
 | Option | Values | Default | Description |
 |--------|--------|---------|-------------|
@@ -436,19 +437,52 @@ a compiler error.
 models:
   my_project:
     streaming_events:
-      +stream_options:
+      +write_stream_options:
         fanout-enabled: "true"
         check-nullability: "true"
         check-ordering: "false"
         snapshot-property.app-id: my_supervisor_v1
 ```
 
+`stream_options` has been renamed to `write_stream_options`; update existing
+model configuration to use the new name.
+
+**Iceberg streaming reader options**
+
+`read_stream_options` applies the same options to every streaming table read
+created by dbt: SQL-model `ref()` and `source()` inputs, and table-valued Python
+`dbt.ref()` and `dbt.source()` inputs. It does not modify direct user-authored
+`spark.readStream` calls. This config is supported only by `materialized:
+streaming`. Option names and values must be strings.
+
+| Option | Accepted alias | Values |
+|--------|----------------|--------|
+| `stream-from-timestamp` | `streamFromTimestamp` | Epoch milliseconds as a numeric string. |
+| `start-snapshot-id` | `startSnapshotId` | Snapshot ID as a numeric string. |
+| `end-snapshot-id` | `endSnapshotId` | Snapshot ID as a numeric string. |
+| `startingVersion` | None | `"latest"` or a snapshot ID as a numeric string. |
+| `split-size` | `splitSize` | Bytes as a numeric string. |
+| `streaming-skip-delete-snapshots` | `streamingSkipDeleteSnapshots` | `"true"` or `"false"`. |
+| `streaming-skip-overwrite-snapshots` | `streamingSkipOverwriteSnapshots` | `"true"` or `"false"`. |
+| `streaming-max-files-per-micro-batch` | `streamingMaxFilesPerMicroBatch` | Numeric string. |
+| `streaming-max-rows-per-micro-batch` | `streamingMaxRowsPerMicroBatch` | Numeric string. |
+
+```yaml
+models:
+  my_project:
+    streaming_events:
+      +read_stream_options:
+        startingVersion: "latest"
+        streaming-skip-overwrite-snapshots: "true"
+```
+
 **Operational limitations**
 
 - Only `spark_session_based_cluster` is supported; job-cluster and remote
   submission methods cannot manage persistent local streaming queries.
-- dbt does not stop or restart an active stream. Updated `stream_options` take
-  effect only after the current query is stopped and dbt starts a new one.
+- dbt does not stop or restart an active stream. Updated `write_stream_options`
+  and `read_stream_options` take effect only after the current query is stopped
+  and dbt starts a new one.
 - SQL model relation references are rewritten with SQLGlot, preserving aliases,
   CTEs, string literals, and comments while substituting the internal streaming
   temporary views.

@@ -32,7 +32,7 @@ def _raise_compiler_error(message):
     raise _CompilerError(message)
 
 
-def _stream_options(config):
+def _write_stream_options(config):
     environment = Environment(extensions=["jinja2.ext.do"])
     template = environment.from_string(_jinja_source())
     template.globals.update(
@@ -47,7 +47,25 @@ def _stream_options(config):
             "spark__escape_single_quotes": lambda value: value.replace("'", "\\'"),
         }
     )
-    return template.module.spark__stream_options_clause()
+    return template.module.spark__write_stream_options_clause()
+
+
+def _read_stream_options(config):
+    environment = Environment(extensions=["jinja2.ext.do"])
+    template = environment.from_string(_jinja_source())
+    template.globals.update(
+        {
+            "config": type(
+                "Config", (), {"get": lambda _, key, default=None: config.get(key, default)}
+            )(),
+            "exceptions": type(
+                "Exceptions", (), {"raise_compiler_error": staticmethod(_raise_compiler_error)}
+            )(),
+            "return": lambda value: value,
+            "spark__escape_single_quotes": lambda value: value.replace("'", "\\'"),
+        }
+    )
+    return template.module.spark__read_stream_options_clause("reader")
 
 
 def _render_stream_table(
@@ -56,29 +74,22 @@ def _render_stream_table(
     location_root: str | None = None,
     partition_by: list[str] | None = None,
     tblproperties: dict[str, str] | None = None,
+    read_stream_options: dict[str, str] | None = None,
 ) -> str:
+    render_config = {
+        "location_root": location_root,
+        "partition_by": partition_by,
+        "read_stream_options": read_stream_options or {},
+        "stream_options": None,
+        "tblproperties": tblproperties,
+        "write_stream_options": {},
+    }
     environment = Environment(extensions=["jinja2.ext.do"])
     template = environment.from_string(_jinja_source())
     template.globals.update(
         {
             "config": type(
-                "Config",
-                (),
-                {
-                    "get": lambda _, key, default=None: (
-                        {}
-                        if key == "stream_options"
-                        else (
-                            location_root
-                            if key == "location_root"
-                            else (
-                                partition_by
-                                if key == "partition_by"
-                                else tblproperties if key == "tblproperties" else default
-                            )
-                        )
-                    )
-                },
+                "Config", (), {"get": lambda _, key, default=None: render_config.get(key, default)}
             )(),
             "adapter": type(
                 "Adapter",
@@ -116,7 +127,6 @@ def _render_stream_table(
             ),
             "return": lambda value: value,
             "spark__escape_single_quotes": lambda value: value.replace("'", "\\'"),
-            "spark__stream_options_clause": lambda: "",
         }
     )
     macro = getattr(template.module, macro_name)
@@ -149,7 +159,7 @@ def test_streaming_materialization_reuses_active_query_before_model_execution():
 
     assert active_query_guard < model_execution
     assert "skipping startup" in source
-    assert "Changed stream_options take effect after the stream is restarted" in source
+    assert "Changed write_stream_options and read_stream_options" in source
 
 
 def test_streaming_materialization_creates_v2_sink_and_syncs_metadata():
@@ -214,6 +224,18 @@ def test_streaming_materialization_indents_shared_writer_helpers(macro_name):
     assert '        writer = writer.tableProperty("owner", "analytics")' in rendered
 
 
+@pytest.mark.parametrize("macro_name", ["py_stream_table", "sql_stream_table"])
+def test_streaming_materialization_applies_read_stream_options_before_table(macro_name):
+    rendered = _render_stream_table(macro_name, read_stream_options={"startSnapshotId": "12345"})
+
+    compile(rendered, f"{macro_name}.py", "exec")
+
+    option = 'reader = reader.option("startSnapshotId", "12345")'
+    table = "reader.table("
+    assert option in rendered
+    assert rendered.index(option) < rendered.index(table)
+
+
 def test_streaming_materialization_only_waits_when_configured():
     source = _source()
 
@@ -222,11 +244,11 @@ def test_streaming_materialization_only_waits_when_configured():
     assert "active_query.awaitTermination()" in source
 
 
-def test_stream_options_render_on_data_stream_writer():
-    rendered = _stream_options(
+def test_write_stream_options_render_on_data_stream_writer():
+    rendered = _write_stream_options(
         {
             "file_format": "iceberg",
-            "stream_options": {
+            "write_stream_options": {
                 "fanout-enabled": "true",
                 "check-nullability": "true",
                 "check-ordering": "false",
@@ -239,7 +261,7 @@ def test_stream_options_render_on_data_stream_writer():
     assert '.option("check-nullability", "true")' in rendered
     assert '.option("check-ordering", "false")' in rendered
     assert '.option("snapshot-property.app-id", "my_supervisor_v1")' in rendered
-    assert _source().index("spark__stream_options_clause") > _source().index(
+    assert _source().index("spark__write_stream_options_clause") > _source().index(
         "{{ dataframe }}.writeStream"
     )
 
@@ -247,19 +269,62 @@ def test_stream_options_render_on_data_stream_writer():
 @pytest.mark.parametrize(
     "config, message",
     [
-        ({"file_format": "delta", "stream_options": {"fanout-enabled": "true"}}, "iceberg"),
-        ({"file_format": "iceberg", "stream_options": ["fanout-enabled"]}, "dictionary"),
-        ({"file_format": "iceberg", "stream_options": {"fanout-enabled": True}}, "true"),
+        ({"file_format": "delta", "write_stream_options": {"fanout-enabled": "true"}}, "iceberg"),
+        ({"file_format": "iceberg", "write_stream_options": ["fanout-enabled"]}, "dictionary"),
+        ({"file_format": "iceberg", "write_stream_options": {"fanout-enabled": True}}, "true"),
         (
-            {"file_format": "iceberg", "stream_options": {"snapshot-property.": "value"}},
+            {"file_format": "iceberg", "write_stream_options": {"snapshot-property.": "value"}},
             "Unsupported",
         ),
-        ({"file_format": "iceberg", "stream_options": {"unknown": "value"}}, "Unsupported"),
+        ({"file_format": "iceberg", "write_stream_options": {"unknown": "value"}}, "Unsupported"),
+        ({"file_format": "iceberg", "write_stream_options": {1: "value"}}, "keys must be strings"),
     ],
 )
-def test_stream_options_reject_invalid_configuration(config, message):
+def test_write_stream_options_reject_invalid_configuration(config, message):
     with pytest.raises(_CompilerError, match=message):
-        _stream_options(config)
+        _write_stream_options(config)
+
+
+def test_stream_options_requires_renamed_configuration():
+    with pytest.raises(_CompilerError, match="write_stream_options"):
+        _write_stream_options({"stream_options": {"fanout-enabled": "true"}})
+
+
+def test_read_stream_options_render_on_data_stream_reader():
+    rendered = _read_stream_options(
+        {
+            "read_stream_options": {
+                "stream-from-timestamp": "1628000000000",
+                "startSnapshotId": "12345",
+                "startingVersion": "latest",
+                "streamingSkipDeleteSnapshots": "true",
+                "streaming-max-rows-per-micro-batch": "500",
+            }
+        }
+    )
+
+    assert 'reader = reader.option("stream-from-timestamp", "1628000000000")' in rendered
+    assert 'reader = reader.option("startSnapshotId", "12345")' in rendered
+    assert 'reader = reader.option("startingVersion", "latest")' in rendered
+    assert 'reader = reader.option("streamingSkipDeleteSnapshots", "true")' in rendered
+    assert 'reader = reader.option("streaming-max-rows-per-micro-batch", "500")' in rendered
+
+
+@pytest.mark.parametrize(
+    "config, message",
+    [
+        ({"read_stream_options": ["startSnapshotId"]}, "dictionary"),
+        ({"read_stream_options": {"unknown": "1"}}, "Unsupported"),
+        ({"read_stream_options": {1: "1"}}, "keys must be strings"),
+        ({"read_stream_options": {"start-snapshot-id": 1}}, "string value"),
+        ({"read_stream_options": {"start-snapshot-id": "latest"}}, "numeric"),
+        ({"read_stream_options": {"startingVersion": "invalid"}}, "latest"),
+        ({"read_stream_options": {"streaming-skip-delete-snapshots": "yes"}}, "true"),
+    ],
+)
+def test_read_stream_options_reject_invalid_configuration(config, message):
+    with pytest.raises(_CompilerError, match=message):
+        _read_stream_options(config)
 
 
 def test_rewrite_streaming_sql_replaces_only_table_references():

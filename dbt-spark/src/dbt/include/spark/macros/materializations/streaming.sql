@@ -52,14 +52,16 @@ if active_query is None:
     def load_df_from_table_or_sql(source_or_ref_value):
         if (source_or_ref_value.strip().startswith("(") and source_or_ref_value.strip().endswith(")")) or "select " in source_or_ref_value.lower():
             return spark.sql(source_or_ref_value)
-        return spark.table(source_or_ref_value)
+        reader = spark.readStream
+    {{ spark__read_stream_options_clause('reader') | indent(4, true) }}
+        return reader.table(source_or_ref_value)
 
     dbt = dbtObj(load_df_from_table_or_sql)
     df = model(dbt, spark)
 
 {{ start_stream('df', target_exists) | indent(4, true) }}
 else:
-    print(f"Stream {target_name} is already active (id={active_query.id}); skipping startup. Changed stream_options take effect after the stream is restarted.")
+    print(f"Stream {target_name} is already active (id={active_query.id}); skipping startup. Changed write_stream_options and read_stream_options take effect after the stream is restarted.")
 
 {% set await_termination = config.get('await_termination') %}
 {% if await_termination is none %}
@@ -99,12 +101,14 @@ if active_query is None:
         {%- endfor -%}
     }
     for relation, temporary_view in stream_inputs.items():
-        spark.readStream.table(relation).createOrReplaceTempView(temporary_view)
+        reader = spark.readStream
+    {{ spark__read_stream_options_clause('reader') | indent(4, true) }}
+        reader.table(relation).createOrReplaceTempView(temporary_view)
 
     df = spark.sql(rewrite_streaming_sql({{ compiled_code | tojson }}, stream_inputs))
 {{ start_stream('df', target_exists) | indent(4, true) }}
 else:
-    print(f"Stream {target_name} is already active (id={active_query.id}); skipping startup. Changed stream_options take effect after the stream is restarted.")
+    print(f"Stream {target_name} is already active (id={active_query.id}); skipping startup. Changed write_stream_options and read_stream_options take effect after the stream is restarted.")
 
 {% set await_termination = config.get('await_termination') %}
 {% if await_termination is none %}
@@ -143,7 +147,7 @@ active_query = (
     {{ dataframe }}.writeStream
     .queryName(target_name)
     .option("checkpointLocation", checkpoint_location)
-{{ spark__stream_options_clause() | indent(4, true) }}
+{{ spark__write_stream_options_clause() | indent(4, true) }}
     .trigger(processingTime=trigger)
     .toTable(target_name)
 )
@@ -151,27 +155,59 @@ print(f"Started stream {target_name} (id={active_query.id}, checkpoint={checkpoi
 {% endmacro %}
 
 
-{% macro spark__stream_options_clause() %}
-    {%- set stream_options = config.get('stream_options') -%}
-    {%- if stream_options is none -%}
+{% macro spark__write_stream_options_clause() %}
+    {%- if config.get('stream_options') is not none -%}
+        {{ exceptions.raise_compiler_error("stream_options has been renamed to write_stream_options") }}
+    {%- endif -%}
+    {%- set write_stream_options = config.get('write_stream_options') -%}
+    {%- if write_stream_options is none -%}
         {{ return('') }}
     {%- endif -%}
-    {%- if not stream_options is mapping -%}
-        {{ exceptions.raise_compiler_error("stream_options must be a dictionary") }}
+    {%- if not write_stream_options is mapping -%}
+        {{ exceptions.raise_compiler_error("write_stream_options must be a dictionary") }}
     {%- endif -%}
-    {%- if stream_options | length > 0 and config.get('file_format') != 'iceberg' -%}
-        {{ exceptions.raise_compiler_error("stream_options are supported only for file_format='iceberg'") }}
+    {%- if write_stream_options | length > 0 and config.get('file_format') != 'iceberg' -%}
+        {{ exceptions.raise_compiler_error("write_stream_options are supported only for file_format='iceberg'") }}
     {%- endif -%}
-    {%- for option, value in stream_options.items() -%}
-        {%- if option in ('fanout-enabled', 'check-nullability', 'check-ordering') -%}
+    {%- for option, value in write_stream_options.items() -%}
+        {%- if option is not string -%}
+            {{ exceptions.raise_compiler_error("write_stream_options keys must be strings; got " ~ option) }}
+        {%- elif option in ('fanout-enabled', 'check-nullability', 'check-ordering') -%}
             {%- if value is not string or value not in ('true', 'false') -%}
-                {{ exceptions.raise_compiler_error("stream_options '" ~ option ~ "' must be the string 'true' or 'false'") }}
+                {{ exceptions.raise_compiler_error("write_stream_options '" ~ option ~ "' must be the string 'true' or 'false'") }}
             {%- endif -%}
         {%- elif not option.startswith('snapshot-property.') or option == 'snapshot-property.' -%}
-            {{ exceptions.raise_compiler_error("Unsupported stream_options key '" ~ option ~ "'. Supported keys are fanout-enabled, check-nullability, check-ordering, and snapshot-property.<key>.") }}
+            {{ exceptions.raise_compiler_error("Unsupported write_stream_options key '" ~ option ~ "'. Supported keys are fanout-enabled, check-nullability, check-ordering, and snapshot-property.<key>.") }}
         {%- elif value is not string -%}
-            {{ exceptions.raise_compiler_error("stream_options '" ~ option ~ "' must have a string value") }}
+            {{ exceptions.raise_compiler_error("write_stream_options '" ~ option ~ "' must have a string value") }}
         {%- endif -%}
                 .option("{{ option }}", "{{ spark__escape_single_quotes(value) }}")
+    {%- endfor -%}
+{% endmacro %}
+
+
+{% macro spark__read_stream_options_clause(reader) %}
+    {%- set read_stream_options = config.get('read_stream_options') -%}
+    {%- if read_stream_options is none -%}
+        {{ return('') }}
+    {%- endif -%}
+    {%- if not read_stream_options is mapping -%}
+        {{ exceptions.raise_compiler_error("read_stream_options must be a dictionary") }}
+    {%- endif -%}
+    {%- for option, value in read_stream_options.items() -%}
+        {%- if option is not string -%}
+            {{ exceptions.raise_compiler_error("read_stream_options keys must be strings; got " ~ option) }}
+        {%- elif option not in ('stream-from-timestamp', 'streamFromTimestamp', 'start-snapshot-id', 'startSnapshotId', 'end-snapshot-id', 'endSnapshotId', 'startingVersion', 'split-size', 'splitSize', 'streaming-skip-delete-snapshots', 'streamingSkipDeleteSnapshots', 'streaming-skip-overwrite-snapshots', 'streamingSkipOverwriteSnapshots', 'streaming-max-files-per-micro-batch', 'streamingMaxFilesPerMicroBatch', 'streaming-max-rows-per-micro-batch', 'streamingMaxRowsPerMicroBatch') -%}
+            {{ exceptions.raise_compiler_error("Unsupported read_stream_options key '" ~ option ~ "'. Supported keys are stream-from-timestamp, streamFromTimestamp, start-snapshot-id, startSnapshotId, end-snapshot-id, endSnapshotId, startingVersion, split-size, splitSize, streaming-skip-delete-snapshots, streamingSkipDeleteSnapshots, streaming-skip-overwrite-snapshots, streamingSkipOverwriteSnapshots, streaming-max-files-per-micro-batch, streamingMaxFilesPerMicroBatch, streaming-max-rows-per-micro-batch, and streamingMaxRowsPerMicroBatch.") }}
+        {%- elif value is not string -%}
+            {{ exceptions.raise_compiler_error("read_stream_options '" ~ option ~ "' must have a string value") }}
+        {%- elif option in ('streaming-skip-delete-snapshots', 'streamingSkipDeleteSnapshots', 'streaming-skip-overwrite-snapshots', 'streamingSkipOverwriteSnapshots') and value not in ('true', 'false') -%}
+            {{ exceptions.raise_compiler_error("read_stream_options '" ~ option ~ "' must be the string 'true' or 'false'") }}
+        {%- elif option == 'startingVersion' and value != 'latest' and not value.isdigit() -%}
+            {{ exceptions.raise_compiler_error("read_stream_options 'startingVersion' must be 'latest' or a numeric string") }}
+        {%- elif option != 'startingVersion' and option not in ('streaming-skip-delete-snapshots', 'streamingSkipDeleteSnapshots', 'streaming-skip-overwrite-snapshots', 'streamingSkipOverwriteSnapshots') and not value.isdigit() -%}
+            {{ exceptions.raise_compiler_error("read_stream_options '" ~ option ~ "' must be a numeric string") }}
+        {%- endif -%}
+        {{ reader }} = {{ reader }}.option("{{ option }}", "{{ spark__escape_single_quotes(value) }}")
     {%- endfor -%}
 {% endmacro %}

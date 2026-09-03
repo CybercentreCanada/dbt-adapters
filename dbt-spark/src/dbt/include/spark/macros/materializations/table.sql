@@ -1,4 +1,5 @@
 {% materialization table, adapter = 'spark', supported_languages=['sql', 'python'] %}
+  {% do spark__validate_streaming_options_config('table') %}
   {%- set language = model['language'] -%}
   {%- set identifier = model['alias'] -%}
   {%- set grant_config = config.get('grants') -%}
