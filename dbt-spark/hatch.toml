@@ -7,7 +7,7 @@ sources = ["src"]
 
 [envs.default]
 pre-install-commands = [
-    "pip install dbt-core@git+https://github.com/dbt-labs/dbt-core.git#subdirectory=core",
+    "pip install dbt-core@git+https://github.com/dbt-labs/dbt-core.git@1.latest#subdirectory=core",
     "pip install -e ../dbt-adapters",
     "pip install -e ../dbt-tests-adapter",
 ]
@@ -22,6 +22,7 @@ dependencies = [
     "pytest-dotenv",
     "pytest-mock",
     "pytest-xdist",
+    "tenacity",
 ]
 features=["all"]
 
@@ -87,6 +88,7 @@ dependencies = [
     "pytest-csv~=3.0",
     "pytest-mock",
     "pytest-xdist",
+    "tenacity",
 ]
 features=["all"]
 
@@ -106,6 +108,7 @@ dependencies = [
     "pytest-csv~=3.0",
     "pytest-mock",
     "pytest-xdist",
+    "tenacity",
 ]
 features=["all"]
 
