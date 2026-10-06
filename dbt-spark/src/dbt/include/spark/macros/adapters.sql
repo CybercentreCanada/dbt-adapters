@@ -380,11 +380,26 @@ writer = writer.option("location", target_location)
 {% endmacro %}
 
 {% macro spark__persist_docs(relation, model, for_relation, for_columns) -%}
-  {% if for_columns and config.persist_column_docs() and model.columns %}
-    {%- set existing_columns = adapter.get_columns_in_relation(relation) -%}
-    {%- set columns_to_update = adapter.get_persist_doc_columns(existing_columns, model.columns) -%}
-    {% do alter_column_comment(relation, columns_to_update) %}
+  {%- set check_relation = for_relation and config.persist_relation_docs() -%}
+  {%- set check_columns = for_columns and config.persist_column_docs() and model.columns -%}
+  {% if check_relation or check_columns %}
+    {%- set diff = adapter.get_persist_docs_diff(relation, model.description, model.columns, check_relation, check_columns) -%}
+    {% if diff is not none %}
+      {% if diff.relation_comment is not none %}
+        {% do alter_relation_comment(relation, diff.relation_comment) %}
+      {% endif %}
+      {% if diff.columns %}
+        {% do alter_column_comment(relation, diff.columns) %}
+      {% endif %}
+    {% endif %}
   {% endif %}
+{% endmacro %}
+
+{% macro spark__alter_relation_comment(relation, relation_comment) %}
+  {{ log('Updating table comment on ' ~ relation) }}
+  {% call statement('alter_relation_comment') -%}
+    comment on table {{ relation }} is '{{ spark__escape_single_quotes(relation_comment) }}'
+  {%- endcall %}
 {% endmacro %}
 
 {% macro spark__alter_column_comment(relation, column_dict) %}

@@ -88,6 +88,60 @@ class TestMicrobatchMacros(unittest.TestCase):
             )
         self.assertIn("partition_by", str(ctx.exception))
 
+    # -- incremental.sql -----------------------------------------------------
+
+    def test_incremental_gates_metadata_sync_on_first_batch_claim(self):
+        with open(
+            "src/dbt/include/spark/macros/materializations/incremental/incremental.sql"
+        ) as f:
+            source = f.read()
+        self.assertNotIn("is_concurrent_microbatch", source)
+        self.assertIn(
+            "sync_metadata = (not model.batch) or "
+            "adapter.claim_metadata_sync(target_relation, invocation_id)",
+            source,
+        )
+        gate = source.index("{%- if sync_metadata -%}")
+        self.assertLess(gate, source.index("adapter.check_partition_sync"))
+        self.assertLess(gate, source.index("sync_tblproperties(target_relation"))
+        self.assertIn(
+            "{% if sync_metadata %}\n    {% do persist_docs(target_relation, model) %}", source
+        )
+
+    # -- adapters.sql: persist_docs ------------------------------------------
+
+    def _render_persist_docs(self, diff, persist_relation=True, persist_columns=True):
+        calls = {"relation": [], "columns": []}
+        self.default_context["alter_relation_comment"] = lambda r, c: calls["relation"].append(c)
+        self.default_context["alter_column_comment"] = lambda r, c: calls["columns"].append(c)
+        config = self.default_context["config"]
+        config.persist_relation_docs = lambda: persist_relation
+        config.persist_column_docs = lambda: persist_columns
+        adapter = self.default_context["adapter"]
+        adapter.get_persist_docs_diff = mock.Mock(return_value=diff)
+        model = mock.Mock(description="desc", columns={"c": {"description": "d"}})
+        template = self._get_template("adapters.sql")
+        template.module.spark__persist_docs("rel", model, True, True)
+        return adapter.get_persist_docs_diff, calls
+
+    def test_persist_docs_no_changes_emits_nothing(self):
+        _, calls = self._render_persist_docs({"relation_comment": None, "columns": {}})
+        self.assertEqual(calls, {"relation": [], "columns": []})
+
+    def test_persist_docs_applies_only_diff(self):
+        cols = {"c": {"description": "d"}}
+        _, calls = self._render_persist_docs({"relation_comment": "new", "columns": cols})
+        self.assertEqual(calls, {"relation": ["new"], "columns": [cols]})
+
+    def test_persist_docs_disabled_skips_describe(self):
+        get_diff, calls = self._render_persist_docs(
+            {"relation_comment": "new", "columns": {}},
+            persist_relation=False,
+            persist_columns=False,
+        )
+        get_diff.assert_not_called()
+        self.assertEqual(calls, {"relation": [], "columns": []})
+
 
 if __name__ == "__main__":
     unittest.main()

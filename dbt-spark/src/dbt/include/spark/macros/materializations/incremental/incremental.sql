@@ -19,6 +19,13 @@
   {%- set existing_relation = load_relation(this) -%}
 
   {#--
+    Metadata mutations (partition check, tblproperties, comments) race when microbatch
+    batches run in parallel. dbt-core always runs batch 0 sequentially before any
+    concurrent batch, so only the first claimer per invocation syncs metadata.
+  --#}
+  {%- set sync_metadata = (not model.batch) or adapter.claim_metadata_sync(target_relation, invocation_id) -%}
+
+  {#--
     Build the tmp relation identifier with a per-batch suffix so concurrent
     microbatch batches do not clobber each other's temp relations.
     Mirrors the convention used by the base `make_temp_relation` macro at
@@ -92,21 +99,7 @@
     {% do apply_tblproperties(target_relation, config.get('tblproperties')) %}
   {%- else -%}
     {#-- Relation must be merged --#}
-    {#--
-      Per-batch metadata mutations (`check_partition_sync` / `sync_tblproperties`)
-      race when multiple microbatch batches run in parallel. Skip them only
-      when dbt-core may schedule batches concurrently:
-
-        * Not a microbatch run                -> always safe to sync.
-        * `concurrent_batches: false`         -> dbt-core guarantees one batch
-                                                  in flight at a time, safe to sync.
-        * `concurrent_batches: true` or unset -> potentially parallel, skip.
-
-      See dbt-core's `MicrobatchBatchRunner.should_run_in_parallel` for the
-      authoritative resolution logic.
-    --#}
-    {%- set is_concurrent_microbatch = model.batch and config.get('concurrent_batches') != false -%}
-    {%- if not is_concurrent_microbatch -%}
+    {%- if sync_metadata -%}
       {% do adapter.check_partition_sync(target_relation, config.get('file_format'), config.get('partition_by')) %}
       {% do sync_tblproperties(target_relation, config.get('tblproperties')) %}
     {%- endif -%}
@@ -136,7 +129,9 @@
   {% set should_revoke = should_revoke(existing_relation, full_refresh_mode) %}
   {% do apply_grants(target_relation, grant_config, should_revoke) %}
 
-  {% do persist_docs(target_relation, model) %}
+  {% if sync_metadata %}
+    {% do persist_docs(target_relation, model) %}
+  {% endif %}
 
   {{ run_hooks(post_hooks) }}
 

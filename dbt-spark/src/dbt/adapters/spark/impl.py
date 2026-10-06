@@ -1,5 +1,6 @@
 import os
 import re
+import threading
 from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import (
@@ -135,6 +136,8 @@ DESCRIBE_TABLE_EXTENDED_MACRO_NAME = "describe_table_extended_without_caching"
 
 KEY_TABLE_OWNER = "Owner"
 KEY_TABLE_STATISTICS = "Statistics"
+KEY_TABLE_COMMENT = "Comment"
+KEY_DETAILED_TABLE_INFORMATION = "# Detailed Table Information"
 
 SCHEMA_NOT_FOUND_MESSAGES = (
     "[SCHEMA_NOT_FOUND]",
@@ -229,6 +232,11 @@ class SparkAdapter(SQLAdapter):
     Column: TypeAlias = SparkColumn
     ConnectionManager: TypeAlias = SparkConnectionManager
     AdapterSpecificConfigs: TypeAlias = SparkConfig
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._metadata_sync_lock = threading.Lock()
+        self._metadata_sync_claims: Set[Tuple[str, str]] = set()
 
     # CCCS register all behavior flags for partition drift and relation listing order
     @property
@@ -812,6 +820,66 @@ class SparkAdapter(SQLAdapter):
         existing = TblPropertiesProcessor.from_relation_results(existing_table)
 
         return TblPropertiesProcessor.get_diff(desired, existing)
+
+    @available.parse(lambda *a, **k: False)
+    def claim_metadata_sync(self, relation: BaseRelation, invocation_id: str) -> bool:
+        """Return True only for the first caller per relation per invocation.
+
+        dbt-core runs microbatch batch 0 sequentially before any concurrent batch,
+        so the first claimer is always the batch that can safely mutate metadata.
+        """
+        key = (str(invocation_id), str(relation))
+        with self._metadata_sync_lock:
+            if key in self._metadata_sync_claims:
+                return False
+            self._metadata_sync_claims.add(key)
+            return True
+
+    @staticmethod
+    def _parse_table_comment(rows: Iterable[Any]) -> str:
+        """Extract the table comment from DESCRIBE EXTENDED output, or "" if unset."""
+        in_detailed_info = False
+        for row in rows:
+            name = (row["col_name"] or "").strip()
+            if name == KEY_DETAILED_TABLE_INFORMATION:
+                in_detailed_info = True
+            elif in_detailed_info and name == KEY_TABLE_COMMENT:
+                return row["data_type"] or ""
+        return ""
+
+    @available.parse(lambda *a, **k: None)
+    def get_persist_docs_diff(
+        self,
+        relation: BaseRelation,
+        model_description: Optional[str],
+        model_columns: Optional[Dict[str, Any]],
+        for_relation: bool,
+        for_columns: bool,
+    ) -> Dict[str, Any]:
+        """Compare model docs with the existing relation using a single DESCRIBE EXTENDED.
+
+        Returns {"relation_comment": str or None (None = unchanged), "columns": {...}}.
+        """
+        check_relation = for_relation and not relation.is_view
+        check_columns = for_columns and bool(model_columns)
+        diff: Dict[str, Any] = {"relation_comment": None, "columns": {}}
+        if not check_relation and not check_columns:
+            return diff
+
+        rows = self.execute_macro(
+            GET_COLUMNS_IN_RELATION_RAW_MACRO_NAME, kwargs={"relation": relation}
+        )
+
+        if check_relation:
+            desired = model_description or ""
+            if desired != self._parse_table_comment(rows):
+                diff["relation_comment"] = desired
+
+        if check_columns and model_columns:
+            existing_columns = self.parse_describe_extended(relation, rows)
+            diff["columns"] = self.get_persist_doc_columns(existing_columns, model_columns)
+
+        return diff
 
     @available
     def get_persist_doc_columns(
