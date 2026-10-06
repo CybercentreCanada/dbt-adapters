@@ -1,5 +1,6 @@
 import os
 import re
+import threading
 from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import (
@@ -32,23 +33,93 @@ if TYPE_CHECKING:
 
 from dbt.adapters.base import AdapterConfig, PythonJobHelper
 from dbt.adapters.base.impl import catch_as_completed, ConstraintSupport
+from dbt.adapters.base.meta import available
 from dbt.adapters.sql import SQLAdapter
 from dbt.adapters.spark import SparkConnectionManager
 from dbt.adapters.spark import SparkRelation
 from dbt.adapters.spark import SparkColumn
-
-# CCCS
+from dbt.adapters.spark.relation_configs.tblproperties import (
+    TblPropertiesDiff,
+    TblPropertiesProcessor,
+)
+from dbt.adapters.spark.relation_configs.partitions import (
+    PartitionProcessor,
+)
 from dbt.adapters.spark.python_submissions import (
     JobClusterPythonJobHelper,
     AllPurposeClusterPythonJobHelper,
     SparkSessionBasedClusterPythonJobHelper,
 )
 from dbt.adapters.capability import CapabilityDict, CapabilitySupport, Support, Capability
-
 from dbt.adapters.base import BaseRelation
 from dbt.adapters.contracts.relation import RelationType, RelationConfig
 from dbt_common.clients.agate_helper import DEFAULT_TYPE_TESTER
 from dbt_common.contracts.constraints import ConstraintType
+
+# Behavior flags for partition drift detection
+CHECK_PARTITION_SYNC = {
+    "name": "check_partition_sync",
+    "default": False,
+    "description": (
+        "When enabled, dbt will compare the model's partition_by config against the existing "
+        "Iceberg table partition spec on incremental runs. If they differ, a warning is logged "
+        "or an error is raised depending on the check_partition_sync_raises flag."
+    ),
+}
+
+CHECK_PARTITION_SYNC_RAISES = {
+    "name": "check_partition_sync_raises",
+    "default": False,
+    "description": (
+        "When enabled alongside check_partition_sync, dbt will raise an exception instead of "
+        "logging a warning when the model's partition_by config does not match the existing "
+        "Iceberg table partition spec."
+    ),
+}
+
+# CCCS behavior flag to use v2 relation listing (SHOW TABLES + DESCRIBE EXTENDED)
+USE_V2_RELATION_LISTING = {
+    "name": "use_v2_relation_listing",
+    "default": True,
+    "description": (
+        "When enabled, dbt uses SHOW TABLES + DESCRIBE EXTENDED (v2) as the primary method "
+        "for listing relations, which is compatible with Iceberg v2 tables. Falls back to "
+        "SHOW TABLE EXTENDED (v1) on failure. Disable for legacy Spark catalogs that do not "
+        "support v2 table listing."
+    ),
+}
+
+# CCCS behavior flag to control SET spark.sql.sources.partitionOverwriteMode = DYNAMIC
+SET_PARTITION_OVERWRITE_MODE = {
+    "name": "set_partition_overwrite_mode",
+    "default": True,
+    "description": (
+        "When enabled, dbt emits `SET spark.sql.sources.partitionOverwriteMode = DYNAMIC` "
+        "before insert_overwrite and microbatch operations that use partition_by. On Iceberg "
+        "this is a no-op (Iceberg handles dynamic overwrite natively), but it serves as a "
+        "defensive measure. Disable if the session-level SET causes issues in your environment."
+    ),
+}
+
+# CCCS behavior flag to require location_root on all table materializations
+REQUIRE_LOCATION_ROOT = {
+    "name": "require_location_root",
+    "default": True,
+    "description": (
+        "When enabled, dbt will raise a compiler error if a table materialization does not "
+        "specify a location_root config. This ensures all tables are created at explicit "
+        "storage locations."
+    ),
+}
+
+AWAIT_TERMINATION = {
+    "name": "await_termination",
+    "default": False,
+    "description": (
+        "When enabled, dbt waits for a Python streaming model to terminate before completing "
+        "the run. A model-level await_termination config overrides this default."
+    ),
+}
 
 logger = AdapterLogger("Spark")
 packages = ["pyhive.hive", "thrift.transport", "thrift.protocol"]
@@ -65,6 +136,16 @@ DESCRIBE_TABLE_EXTENDED_MACRO_NAME = "describe_table_extended_without_caching"
 
 KEY_TABLE_OWNER = "Owner"
 KEY_TABLE_STATISTICS = "Statistics"
+KEY_TABLE_COMMENT = "Comment"
+KEY_DETAILED_TABLE_INFORMATION = "# Detailed Table Information"
+
+SCHEMA_NOT_FOUND_MESSAGES = (
+    "[SCHEMA_NOT_FOUND]",
+    "Schema not found",
+    "Database not found",
+    "NoSuchNamespaceException",
+    "NoSuchDatabaseException",
+)
 
 TABLE_OR_VIEW_NOT_FOUND_MESSAGES = (
     "[TABLE_OR_VIEW_NOT_FOUND]",
@@ -75,13 +156,19 @@ TABLE_OR_VIEW_NOT_FOUND_MESSAGES = (
 
 @dataclass
 class SparkConfig(AdapterConfig):
-    file_format: str = "parquet"
+    file_format: str = "iceberg"
     location_root: Optional[str] = None
     partition_by: Optional[Union[List[str], str]] = None
     clustered_by: Optional[Union[List[str], str]] = None
     buckets: Optional[int] = None
     options: Optional[Dict[str, str]] = None
+    tblproperties: Optional[Dict[str, str]] = None
     merge_update_columns: Optional[str] = None
+    await_termination: Optional[bool] = None
+    checkpoint_basedir: Optional[str] = None
+    trigger: Optional[str] = None
+    write_stream_options: Optional[Dict[str, str]] = None
+    read_stream_options: Optional[Dict[str, str]] = None
 
 
 class SparkAdapter(SQLAdapter):
@@ -127,7 +214,17 @@ class SparkAdapter(SQLAdapter):
 
     # CCCS
     _capabilities = CapabilityDict(
-        {Capability.SchemaMetadataByRelations: CapabilitySupport(support=Support.Full)}
+        {
+            Capability.SchemaMetadataByRelations: CapabilitySupport(support=Support.Full),
+            # Microbatch batches can run concurrently because:
+            #   1. Each batch gets a unique tmp relation suffixed with model.batch.id
+            #      (see macros/materializations/incremental/incremental.sql).
+            #   2. Microbatch is gated to file_format='iceberg', whose snapshot-isolated
+            #      INSERT OVERWRITE is safe for concurrent writers to disjoint partitions.
+            #   3. The partitionOverwriteMode SET is controlled by the
+            #      set_partition_overwrite_mode behavior flag; on Iceberg it is a no-op.
+            Capability.MicrobatchConcurrency: CapabilitySupport(support=Support.Full),
+        }
     )
 
     Relation: TypeAlias = SparkRelation
@@ -135,6 +232,23 @@ class SparkAdapter(SQLAdapter):
     Column: TypeAlias = SparkColumn
     ConnectionManager: TypeAlias = SparkConnectionManager
     AdapterSpecificConfigs: TypeAlias = SparkConfig
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._metadata_sync_lock = threading.Lock()
+        self._metadata_sync_claims: Set[Tuple[str, str]] = set()
+
+    # CCCS register all behavior flags for partition drift and relation listing order
+    @property
+    def _behavior_flags(self) -> List[Dict[str, Any]]:
+        return [
+            CHECK_PARTITION_SYNC,
+            CHECK_PARTITION_SYNC_RAISES,
+            USE_V2_RELATION_LISTING,
+            SET_PARTITION_OVERWRITE_MODE,
+            REQUIRE_LOCATION_ROOT,
+            AWAIT_TERMINATION,
+        ]
 
     @classmethod
     def date_function(cls) -> str:
@@ -171,7 +285,9 @@ class SparkAdapter(SQLAdapter):
         return "`{}`".format(identifier)
 
     # CCCS schema_relation added to the method signature
-    def _get_relation_information(self, row: "agate.Row", schema_relation: BaseRelation) -> RelationInfo:
+    def _get_relation_information(
+        self, row: "agate.Row", schema_relation: BaseRelation
+    ) -> RelationInfo:
         """relation info was fetched with SHOW TABLES EXTENDED"""
         try:
             _schema, name, _, information = row
@@ -183,7 +299,9 @@ class SparkAdapter(SQLAdapter):
         return _schema, name, information
 
     # CCCS schema_relation added to get the database
-    def _get_relation_information_using_describe(self, row: "agate.Row", schema_relation: BaseRelation) -> RelationInfo:
+    def _get_relation_information_using_describe(
+        self, row: "agate.Row", schema_relation: BaseRelation
+    ) -> RelationInfo:
         """Relation info fetched using SHOW TABLES and an auxiliary DESCRIBE statement"""
         try:
             _schema, name, _ = row
@@ -266,25 +384,85 @@ class SparkAdapter(SQLAdapter):
 
         return relations
 
+    # CCCS dispatches relation listing to v2-first (default) or v1-first based on behavior flag
     def list_relations_without_caching(self, schema_relation: BaseRelation) -> List[BaseRelation]:
         """Distinct Spark compute engines may not support the same SQL featureset. Thus, we must
-        try different methods to fetch relation information."""
+        try different methods to fetch relation information.
+
+        By default (use_v2_relation_listing=True), uses SHOW TABLES + DESCRIBE EXTENDED (v2)
+        which works with Iceberg v2 tables. Falls back to SHOW TABLE EXTENDED (v1) on failure.
+
+        When use_v2_relation_listing is disabled, uses SHOW TABLE EXTENDED (v1) first and falls
+        back to v2 when encountering the 'not supported for v2 tables' error.
+        """
 
         kwargs = {"schema_relation": schema_relation}
+
+        if self.behavior.use_v2_relation_listing:
+            return self._list_relations_v2_first(kwargs, schema_relation)
+        else:
+            return self._list_relations_v1_first(kwargs, schema_relation)
+
+    # CCCS v2-first: uses SHOW TABLES + DESCRIBE EXTENDED, falls back to SHOW TABLE EXTENDED
+    def _list_relations_v2_first(
+        self, kwargs: Dict[str, Any], schema_relation: BaseRelation
+    ) -> List[BaseRelation]:
+        """SHOW TABLES + DESCRIBE EXTENDED (v2) first, SHOW TABLE EXTENDED (v1) fallback."""
         try:
-            # Default compute engine behavior: show tables extended
-            show_table_extended_rows = self.execute_macro(LIST_RELATIONS_MACRO_NAME, kwargs=kwargs)
+            show_table_rows = self.execute_macro(
+                LIST_RELATIONS_SHOW_TABLES_MACRO_NAME, kwargs=kwargs
+            )
             return self._build_spark_relation_list(
-                row_list=show_table_extended_rows,
-                relation_info_func=self._get_relation_information,
-                # CCCS pass BaseRelation to get destination database
+                row_list=show_table_rows,
+                relation_info_func=self._get_relation_information_using_describe,
                 schema_relation=schema_relation,
             )
         except DbtRuntimeError as e:
             errmsg = getattr(e, "msg", "")
-            if f"Database '{schema_relation}' not found" in errmsg:
+            if any(msg in errmsg for msg in SCHEMA_NOT_FOUND_MESSAGES) or any(
+                msg in errmsg for msg in TABLE_OR_VIEW_NOT_FOUND_MESSAGES
+            ):
                 return []
-            # Iceberg compute engine behavior: show table
+            logger.debug(
+                f"v2 relation listing failed for {schema_relation}, "
+                f"falling back to SHOW TABLE EXTENDED: {errmsg}"
+            )
+
+        # Fallback to v1: SHOW TABLE EXTENDED
+        try:
+            show_table_extended_rows = self.execute_macro(LIST_RELATIONS_MACRO_NAME, kwargs=kwargs)
+            return self._build_spark_relation_list(
+                row_list=show_table_extended_rows,
+                relation_info_func=self._get_relation_information,
+                schema_relation=schema_relation,
+            )
+        except DbtRuntimeError as e:
+            errmsg = getattr(e, "msg", "")
+            if any(msg in errmsg for msg in SCHEMA_NOT_FOUND_MESSAGES) or any(
+                msg in errmsg for msg in TABLE_OR_VIEW_NOT_FOUND_MESSAGES
+            ):
+                return []
+            raise
+
+    # CCCS v1-first: uses SHOW TABLE EXTENDED, falls back to v2 on 'not supported for v2 tables'
+    def _list_relations_v1_first(
+        self, kwargs: Dict[str, Any], schema_relation: BaseRelation
+    ) -> List[BaseRelation]:
+        """SHOW TABLE EXTENDED (v1) first, SHOW TABLES + DESCRIBE EXTENDED (v2) fallback."""
+        try:
+            show_table_extended_rows = self.execute_macro(LIST_RELATIONS_MACRO_NAME, kwargs=kwargs)
+            return self._build_spark_relation_list(
+                row_list=show_table_extended_rows,
+                relation_info_func=self._get_relation_information,
+                schema_relation=schema_relation,
+            )
+        except DbtRuntimeError as e:
+            errmsg = getattr(e, "msg", "")
+            if any(msg in errmsg for msg in SCHEMA_NOT_FOUND_MESSAGES) or any(
+                msg in errmsg for msg in TABLE_OR_VIEW_NOT_FOUND_MESSAGES
+            ):
+                return []
+            # Iceberg v2 tables: https://issues.apache.org/jira/browse/SPARK-33393
             elif "SHOW TABLE EXTENDED is not supported for v2 tables" in errmsg:
                 # this happens with spark-iceberg with v2 iceberg tables
                 # https://issues.apache.org/jira/browse/SPARK-33393
@@ -304,10 +482,7 @@ class SparkAdapter(SQLAdapter):
                     logger.debug(f"{description} {schema_relation}: {e.msg}")
                     return []
             else:
-                logger.debug(
-                    f"Error while retrieving information about {schema_relation}: {errmsg}"
-                )
-                return []
+                raise
 
     def get_relation(self, database: str, schema: str, identifier: str) -> Optional[BaseRelation]:
         if not self.Relation.get_default_include_policy().database:
@@ -342,6 +517,7 @@ class SparkAdapter(SQLAdapter):
                 column=column["col_name"],
                 column_index=idx,
                 dtype=column["data_type"],
+                comment=column["comment"],
             )
             for idx, column in enumerate(rows)
         ]
@@ -423,6 +599,17 @@ class SparkAdapter(SQLAdapter):
                 yield as_dict
         else:
             columns = self.parse_columns_from_information(relation)
+
+        if not columns:
+            # The DESCRIBE EXTENDED fallback path (e.g. Iceberg v2 tables) embeds
+            # column definitions in the information string as flat "col: type"
+            # lines, which INFORMATION_COLUMNS_REGEX does not match.  Fall back
+            # to querying the table schema directly via DESCRIBE EXTENDED.
+            try:
+                columns = self.get_columns_in_relation(relation)
+            except DbtRuntimeError as e:
+                logger.debug(f"Error retrieving columns for catalog entry {relation}: {e.msg}")
+                columns = []
 
         for column in columns:
             # convert SparkColumns into catalog dicts
@@ -508,7 +695,7 @@ class SparkAdapter(SQLAdapter):
                 database=relation.database,
                 schema=relation.schema,
                 identifier=relation.identifier,
-                type=RelationType.Table,
+                type=RelationType.Table,  # type: ignore[arg-type]
                 information=relation.information,
                 is_delta=False,
                 is_iceberg=True,
@@ -616,6 +803,154 @@ class SparkAdapter(SQLAdapter):
     def debug_query(self) -> None:
         """Override for DebugTask method"""
         self.execute("select 1 as id")
+
+    @available.parse(lambda *a, **k: None)
+    def get_tblproperties_diff(
+        self, relation: BaseRelation, desired_tblproperties: Optional[Dict[str, str]]
+    ) -> Optional[TblPropertiesDiff]:
+        """Compare desired tblproperties with existing ones and return a structured diff.
+
+        Returns None if no changes are needed.  The diff carries both properties to SET
+        and properties to UNSET so callers can issue the appropriate ALTER statements.
+        """
+        desired = TblPropertiesProcessor.from_relation_config(desired_tblproperties)
+
+        # Fetch existing properties from the server
+        existing_table = self.execute_macro("fetch_tbl_properties", kwargs={"relation": relation})
+        existing = TblPropertiesProcessor.from_relation_results(existing_table)
+
+        return TblPropertiesProcessor.get_diff(desired, existing)
+
+    @available.parse(lambda *a, **k: False)
+    def claim_metadata_sync(self, relation: BaseRelation, invocation_id: str) -> bool:
+        """Return True only for the first caller per relation per invocation.
+
+        dbt-core runs microbatch batch 0 sequentially before any concurrent batch,
+        so the first claimer is always the batch that can safely mutate metadata.
+        """
+        key = (str(invocation_id), str(relation))
+        with self._metadata_sync_lock:
+            if key in self._metadata_sync_claims:
+                return False
+            self._metadata_sync_claims.add(key)
+            return True
+
+    @staticmethod
+    def _parse_table_comment(rows: Iterable[Any]) -> str:
+        """Extract the table comment from DESCRIBE EXTENDED output, or "" if unset."""
+        in_detailed_info = False
+        for row in rows:
+            name = (row["col_name"] or "").strip()
+            if name == KEY_DETAILED_TABLE_INFORMATION:
+                in_detailed_info = True
+            elif in_detailed_info and name == KEY_TABLE_COMMENT:
+                return row["data_type"] or ""
+        return ""
+
+    @available.parse(lambda *a, **k: None)
+    def get_persist_docs_diff(
+        self,
+        relation: BaseRelation,
+        model_description: Optional[str],
+        model_columns: Optional[Dict[str, Any]],
+        for_relation: bool,
+        for_columns: bool,
+    ) -> Dict[str, Any]:
+        """Compare model docs with the existing relation using a single DESCRIBE EXTENDED.
+
+        Returns {"relation_comment": str or None (None = unchanged), "columns": {...}}.
+        """
+        check_relation = for_relation and not relation.is_view
+        check_columns = for_columns and bool(model_columns)
+        diff: Dict[str, Any] = {"relation_comment": None, "columns": {}}
+        if not check_relation and not check_columns:
+            return diff
+
+        rows = self.execute_macro(
+            GET_COLUMNS_IN_RELATION_RAW_MACRO_NAME, kwargs={"relation": relation}
+        )
+
+        if check_relation:
+            desired = model_description or ""
+            if desired != self._parse_table_comment(rows):
+                diff["relation_comment"] = desired
+
+        if check_columns and model_columns:
+            existing_columns = self.parse_describe_extended(relation, rows)
+            diff["columns"] = self.get_persist_doc_columns(existing_columns, model_columns)
+
+        return diff
+
+    @available
+    def get_persist_doc_columns(
+        self, existing_columns: List[SparkColumn], columns: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Returns only columns whose comments differ from existing state.
+
+        Compares the desired description from model config against the current
+        column comment in the database, using case-insensitive column name matching.
+        Only columns that need an update are returned.
+        """
+        return_columns: Dict[str, Any] = {}
+
+        # Case-insensitive lookup: lower(model_col_name) -> original_model_col_name
+        columns_lower = {k.lower(): k for k in columns.keys()}
+
+        for column in existing_columns:
+            name = column.column
+            name_lower = name.lower()
+            if name_lower in columns_lower:
+                original_column_name = columns_lower[name_lower]
+                config_column = columns[original_column_name]
+                if isinstance(config_column, dict):
+                    comment = config_column.get("description", "")
+                elif hasattr(config_column, "description"):
+                    comment = config_column.description or ""
+                else:
+                    continue
+                if comment != (column.comment or ""):
+                    return_columns[name] = columns[original_column_name]
+
+        return return_columns
+
+    @available.parse(lambda *a, **k: None)
+    def check_partition_sync(
+        self, relation: BaseRelation, file_format: Optional[str], partition_by: Optional[object]
+    ) -> None:
+        """Check if the model's partition_by config matches the existing Iceberg table partitions.
+
+        Only runs if:
+        - The check_partition_sync behavior flag is enabled
+        - The file_format is 'iceberg'
+
+        If partitions are out of sync:
+        - Raises DbtRuntimeError if check_partition_sync_raises is True
+        - Logs a warning otherwise
+        """
+        if not self.behavior.check_partition_sync:
+            return
+
+        if file_format != "iceberg":
+            return
+
+        # Fetch existing partition spec from SHOW CREATE TABLE
+        show_create_result = self.execute_macro(
+            "fetch_partition_spec", kwargs={"relation": relation}
+        )
+        existing = PartitionProcessor.from_show_create_table(show_create_result)
+        desired = PartitionProcessor.from_model_config(partition_by)
+
+        if PartitionProcessor.is_out_of_sync(desired, existing):
+            diff_msg = PartitionProcessor.describe_diff(desired, existing)
+            message = (
+                f"Partition drift detected on {relation}.\n"
+                f"{diff_msg}\n"
+                f"The model's partition_by config does not match the existing table partition spec."
+            )
+            if self.behavior.check_partition_sync_raises:
+                raise DbtRuntimeError(message)
+            else:
+                logger.warning(message)
 
     @classmethod
     def _get_adapter_specific_run_info(cls, config: RelationConfig) -> Dict[str, Any]:

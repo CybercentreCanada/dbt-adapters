@@ -1,0 +1,10 @@
+kind: Features
+body: Add post-creation syncing of `tblproperties` for Iceberg tables. On incremental
+  merge runs dbt computes a structural diff between the model config and the existing
+  table properties, issuing `ALTER TABLE SET TBLPROPERTIES` for new/changed keys and
+  `ALTER TABLE UNSET TBLPROPERTIES` for removed keys. Properties prefixed with `polaris_`
+  are automatically excluded from comparison and sync.
+time: 2026-05-29T00:00:00.000000-08:00
+custom:
+  Author: cccs
+  Issue: "0"

@@ -1,6 +1,7 @@
 import unittest
 from unittest import mock
 import re
+from pathlib import Path
 from jinja2 import Environment, FileSystemLoader
 
 
@@ -21,10 +22,13 @@ class TestSparkMacros(unittest.TestCase):
             "config": mock.Mock(),
             "adapter": mock.Mock(),
             "return": lambda r: r,
+            "spark__filtered_tblproperties": lambda props: props if props else None,
+            "spark__escape_single_quotes": lambda expr: expr,
         }
         self.default_context["config"].get = lambda key, default=None, **kwargs: self.config.get(
             key, default
         )
+        self.default_context["adapter"].behavior.require_location_root = False
 
     def __get_template(self, template_filename):
         return self.jinja_env.get_template(template_filename, globals=self.default_context)
@@ -43,13 +47,55 @@ class TestSparkMacros(unittest.TestCase):
     def test_macros_load(self):
         self.jinja_env.get_template("adapters.sql")
 
+    def test_table_rejects_streaming_only_options(self):
+        source = (
+            Path("src/dbt/include/spark/macros/materializations/table.sql")
+            .read_text()
+            .replace(
+                "{% materialization table, adapter = 'spark', supported_languages=['sql', 'python'] %}",
+                "{% macro table() %}",
+            )
+            .replace("{% endmaterialization %}", "{% endmacro %}")
+        )
+        environment = Environment(extensions=["jinja2.ext.do"])
+        template = environment.from_string(source)
+
+        def raise_compiler_error(message):
+            raise ValueError(message)
+
+        template.globals.update(
+            {
+                "config": type(
+                    "Config",
+                    (),
+                    {
+                        "get": lambda _, key, default=None, **kwargs: (
+                            {"fanout-enabled": "true"}
+                            if key == "write_stream_options"
+                            else default
+                        )
+                    },
+                )(),
+                "exceptions": type(
+                    "Exceptions", (), {"raise_compiler_error": staticmethod(raise_compiler_error)}
+                )(),
+                "spark__validate_streaming_options_config": lambda materialization: raise_compiler_error(
+                    "'write_stream_options' is only supported for materialized='streaming'; "
+                    f"remove it from this {materialization} model."
+                ),
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "materialized='streaming'"):
+            template.module.table()
+
     def test_macros_create_table_as(self):
         template = self.__get_template("adapters.sql")
         sql = self.__run_macro(
             template, "spark__create_table_as", False, "my_table", "select 1"
         ).strip()
 
-        self.assertEqual(sql, "create table my_table as select 1")
+        self.assertEqual(sql, "create or replace table my_table using iceberg as select 1")
 
     def test_macros_create_table_as_file_format(self):
         template = self.__get_template("adapters.sql")
@@ -124,17 +170,21 @@ class TestSparkMacros(unittest.TestCase):
         sql = self.__run_macro(
             template, "spark__create_table_as", False, "my_table", "select 1"
         ).strip()
-        self.assertEqual(sql, "create table my_table partitioned by (partition_1) as select 1")
+        self.assertEqual(
+            sql,
+            "create or replace table my_table using iceberg partitioned by (partition_1) as select 1",
+        )
 
     def test_macros_create_table_as_partitions(self):
         template = self.__get_template("adapters.sql")
 
-        self.config["partition_by"] = ["partition_1", "partition_2"]
+        self.config["partition_by"] = ["partition_1", "truncate(4, region_code)"]
         sql = self.__run_macro(
             template, "spark__create_table_as", False, "my_table", "select 1"
         ).strip()
         self.assertEqual(
-            sql, "create table my_table partitioned by (partition_1,partition_2) as select 1"
+            sql,
+            "create or replace table my_table using iceberg partitioned by (partition_1,truncate(4, region_code)) as select 1",
         )
 
     def test_macros_create_table_as_cluster(self):
@@ -146,7 +196,8 @@ class TestSparkMacros(unittest.TestCase):
             template, "spark__create_table_as", False, "my_table", "select 1"
         ).strip()
         self.assertEqual(
-            sql, "create table my_table clustered by (cluster_1) into 1 buckets as select 1"
+            sql,
+            "create or replace table my_table using iceberg clustered by (cluster_1) into 1 buckets as select 1",
         )
 
     def test_macros_create_table_as_clusters(self):
@@ -159,7 +210,7 @@ class TestSparkMacros(unittest.TestCase):
         ).strip()
         self.assertEqual(
             sql,
-            "create table my_table clustered by (cluster_1,cluster_2) into 1 buckets as select 1",
+            "create or replace table my_table using iceberg clustered by (cluster_1,cluster_2) into 1 buckets as select 1",
         )
 
     def test_macros_create_table_as_location(self):
@@ -169,7 +220,45 @@ class TestSparkMacros(unittest.TestCase):
         sql = self.__run_macro(
             template, "spark__create_table_as", False, "my_table", "select 1"
         ).strip()
-        self.assertEqual(sql, "create table my_table location '/mnt/root/my_table' as select 1")
+        self.assertEqual(
+            sql,
+            "create or replace table my_table using iceberg location '/mnt/root/my_table' as select 1",
+        )
+
+    def test_python_location_clause(self):
+        template = self.__get_template("adapters.sql")
+
+        self.config["location_root"] = "/mnt/root"
+        self.default_context["model"].alias = "my_table"
+        python = template.module.python__location_clause()
+
+        self.assertIn('target_location = "/mnt/root/my_table"', python)
+        self.assertIn('writer = writer.option("location", target_location)', python)
+
+    def test_python_partitioned_by_clause_quotes_transform_columns(self):
+        source = (
+            Path("src/dbt/include/spark/macros/materializations/table.sql")
+            .read_text()
+            .replace(
+                "{% materialization table, adapter = 'spark', supported_languages=['sql', 'python'] %}",
+                "{% macro table() %}",
+            )
+            .replace("{% endmaterialization %}", "{% endmacro %}")
+        )
+        template = self.jinja_env.from_string(source, globals=self.default_context)
+
+        self.config["partition_by"] = [
+            "region",
+            "days(ingest_loaded_by)",
+            "months(`created_at`)",
+            "bucket(16, user_id)",
+        ]
+        python = template.module.python__partitionedBy_clause()
+
+        self.assertIn(
+            'writer = writer.partitionedBy("region",days("ingest_loaded_by"),months("created_at"),bucket(16, "user_id"))',
+            python,
+        )
 
     def test_macros_create_table_as_comment(self):
         template = self.__get_template("adapters.sql")
@@ -179,7 +268,10 @@ class TestSparkMacros(unittest.TestCase):
         sql = self.__run_macro(
             template, "spark__create_table_as", False, "my_table", "select 1"
         ).strip()
-        self.assertEqual(sql, "create table my_table comment 'Description Test' as select 1")
+        self.assertEqual(
+            sql,
+            "create or replace table my_table using iceberg comment 'Description Test' as select 1",
+        )
 
     def test_macros_create_table_as_all(self):
         template = self.__get_template("adapters.sql")

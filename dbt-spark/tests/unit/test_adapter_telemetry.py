@@ -3,8 +3,12 @@ from unittest import mock
 import dbt.adapters.__about__
 import dbt.adapters.spark.__version__
 
-from dbt.adapters.spark.impl import SparkAdapter
+from dbt.adapters.spark.impl import SparkAdapter, SparkConfig
 from dbt.adapters.base.relation import AdapterTrackingRelationInfo
+
+
+def test_spark_config_defaults_to_iceberg():
+    assert SparkConfig().file_format == "iceberg"
 
 
 def assert_telemetry_data(adapter_type: str, file_format: str):
