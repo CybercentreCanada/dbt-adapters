@@ -95,7 +95,7 @@ class TestSparkMacros(unittest.TestCase):
             template, "spark__create_table_as", False, "my_table", "select 1"
         ).strip()
 
-        self.assertEqual(sql, "create table my_table as select 1")
+        self.assertEqual(sql, "create or replace table my_table using iceberg as select 1")
 
     def test_macros_create_table_as_file_format(self):
         template = self.__get_template("adapters.sql")
@@ -170,17 +170,21 @@ class TestSparkMacros(unittest.TestCase):
         sql = self.__run_macro(
             template, "spark__create_table_as", False, "my_table", "select 1"
         ).strip()
-        self.assertEqual(sql, "create table my_table partitioned by (partition_1) as select 1")
+        self.assertEqual(
+            sql,
+            "create or replace table my_table using iceberg partitioned by (partition_1) as select 1",
+        )
 
     def test_macros_create_table_as_partitions(self):
         template = self.__get_template("adapters.sql")
 
-        self.config["partition_by"] = ["partition_1", "partition_2"]
+        self.config["partition_by"] = ["partition_1", "truncate(4, region_code)"]
         sql = self.__run_macro(
             template, "spark__create_table_as", False, "my_table", "select 1"
         ).strip()
         self.assertEqual(
-            sql, "create table my_table partitioned by (partition_1,partition_2) as select 1"
+            sql,
+            "create or replace table my_table using iceberg partitioned by (partition_1,truncate(4, region_code)) as select 1",
         )
 
     def test_macros_create_table_as_cluster(self):
@@ -192,7 +196,8 @@ class TestSparkMacros(unittest.TestCase):
             template, "spark__create_table_as", False, "my_table", "select 1"
         ).strip()
         self.assertEqual(
-            sql, "create table my_table clustered by (cluster_1) into 1 buckets as select 1"
+            sql,
+            "create or replace table my_table using iceberg clustered by (cluster_1) into 1 buckets as select 1",
         )
 
     def test_macros_create_table_as_clusters(self):
@@ -205,7 +210,7 @@ class TestSparkMacros(unittest.TestCase):
         ).strip()
         self.assertEqual(
             sql,
-            "create table my_table clustered by (cluster_1,cluster_2) into 1 buckets as select 1",
+            "create or replace table my_table using iceberg clustered by (cluster_1,cluster_2) into 1 buckets as select 1",
         )
 
     def test_macros_create_table_as_location(self):
@@ -215,7 +220,10 @@ class TestSparkMacros(unittest.TestCase):
         sql = self.__run_macro(
             template, "spark__create_table_as", False, "my_table", "select 1"
         ).strip()
-        self.assertEqual(sql, "create table my_table location '/mnt/root/my_table' as select 1")
+        self.assertEqual(
+            sql,
+            "create or replace table my_table using iceberg location '/mnt/root/my_table' as select 1",
+        )
 
     def test_python_location_clause(self):
         template = self.__get_template("adapters.sql")
@@ -260,7 +268,10 @@ class TestSparkMacros(unittest.TestCase):
         sql = self.__run_macro(
             template, "spark__create_table_as", False, "my_table", "select 1"
         ).strip()
-        self.assertEqual(sql, "create table my_table comment 'Description Test' as select 1")
+        self.assertEqual(
+            sql,
+            "create or replace table my_table using iceberg comment 'Description Test' as select 1",
+        )
 
     def test_macros_create_table_as_all(self):
         template = self.__get_template("adapters.sql")

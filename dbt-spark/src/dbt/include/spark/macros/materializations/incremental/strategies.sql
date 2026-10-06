@@ -84,13 +84,13 @@
 
     {% set invalid_microbatch_file_format_msg -%}
       dbt-spark 'microbatch' incremental strategy is only supported when file_format is 'iceberg'.
-      Got file_format='{{ config.get('file_format', default='parquet') }}'.
+      Got file_format='{{ config.get('file_format', default='iceberg') }}'.
     {%- endset %}
 
     {%- if not config.get('partition_by') -%}
       {{ exceptions.raise_compiler_error(missing_partition_key_microbatch_msg) }}
     {%- endif -%}
-    {%- if config.get('file_format', default='parquet') != 'iceberg' -%}
+    {%- if config.get('file_format', default='iceberg') != 'iceberg' -%}
       {{ exceptions.raise_compiler_error(invalid_microbatch_file_format_msg) }}
     {%- endif -%}
     {{ get_insert_overwrite_sql(source, target, existing) }}

@@ -156,7 +156,7 @@ TABLE_OR_VIEW_NOT_FOUND_MESSAGES = (
 
 @dataclass
 class SparkConfig(AdapterConfig):
-    file_format: str = "parquet"
+    file_format: str = "iceberg"
     location_root: Optional[str] = None
     partition_by: Optional[Union[List[str], str]] = None
     clustered_by: Optional[Union[List[str], str]] = None

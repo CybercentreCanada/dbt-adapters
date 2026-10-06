@@ -380,7 +380,7 @@ reads. Batch dimension or lookup joins are not supported by this materialization
 | Config | Default | Description |
 |--------|---------|-------------|
 | `submission_method` | Required | Must be `spark_session_based_cluster`. |
-| `file_format` | `delta` | Sink table file format. Use `iceberg` for `tblproperties` sync and `write_stream_options`. |
+| `file_format` | `iceberg` | Sink table format. `tblproperties` sync and `write_stream_options` require Iceberg. |
 | `checkpoint_basedir` | `DBT_STREAMING_CHECKPOINT_BASEDIR`, then `tmp/dbt-streaming-checkpoints` | Parent directory for the target-specific checkpoint. It must be stable and writable by Spark. |
 | `trigger` | `DBT_STREAMING_TRIGGER`, then `60 seconds` | Structured Streaming processing-time trigger. |
 | `await_termination` | `await_termination` behavior flag | Model-level override for whether dbt waits for the started query. |

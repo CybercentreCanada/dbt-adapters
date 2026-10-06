@@ -1,6 +1,8 @@
 {% materialization table, adapter = 'spark', supported_languages=['sql', 'python'] %}
   {% do spark__validate_streaming_options_config('table') %}
   {%- set language = model['language'] -%}
+  {%- set partition_file_format = config.get('file_format') or 'iceberg' -%}
+  {% do dbt_spark_validate_partition_by(config.get('partition_by'), partition_file_format, 'python' if language == 'python' else 'sql', false, 'table') %}
   {%- set identifier = model['alias'] -%}
   {%- set grant_config = config.get('grants') -%}
 
@@ -16,8 +18,8 @@
   -- in case if the existing and future table is delta or iceberg, we want to do a
   -- create or replace table instead of dropping, so we don't have the table unavailable
   {% if old_relation is not none %}
-    {% set is_delta = (old_relation.is_delta and config.get('file_format', validator=validation.any[basestring]) == 'delta') %}
-    {% set is_iceberg = (old_relation.is_iceberg and config.get('file_format', validator=validation.any[basestring]) == 'iceberg') %}
+    {% set is_delta = (old_relation.is_delta and partition_file_format == 'delta') %}
+    {% set is_iceberg = (old_relation.is_iceberg and partition_file_format == 'iceberg') %}
     {% set old_relation_type = old_relation.type %}
   {% else %}
     {% set is_delta = false %}
@@ -130,7 +132,7 @@ else:
   {# Import functions that can be used for partitioning See https://spark.apache.org/docs/3.5.5/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrameWriterV2.partitionedBy.html #}
   from pyspark.sql.functions import years, months, days, hours, bucket
   writer = df.writeTo("{{ target_relation }}") \
-    .using("{{ config.get('file_format', 'iceberg') }}") \
+    .using("{{ config.get('file_format') or 'iceberg' }}") \
     .option("overwriteSchema", "true")
 
   {{ python__partitionedBy_clause() }}
@@ -149,12 +151,12 @@ else:
     {% set rendered_partitions = [] %}
     {% for partition in partitions %}
       {% set partition = partition | trim %}
-      {% set function = partition.split('(', 1)[0] | trim %}
+      {% set function = partition.split('(', 1)[0] | trim | lower %}
       {% if function in ('years', 'months', 'days', 'hours') %}
         {% if not partition.endswith(')') %}
           {{ exceptions.raise_compiler_error("Invalid partition transform '" ~ partition ~ "'") }}
         {% endif %}
-        {% set column = partition[(function | length) + 1:-1] | trim | replace('`', '') %}
+        {% set column = partition[partition.find('(') + 1:-1] | trim | replace('`', '') %}
         {% if not column %}
           {{ exceptions.raise_compiler_error("Invalid partition transform '" ~ partition ~ "'") }}
         {% endif %}
@@ -163,7 +165,7 @@ else:
         {% if not partition.endswith(')') %}
           {{ exceptions.raise_compiler_error("Invalid partition transform '" ~ partition ~ "'") }}
         {% endif %}
-        {% set arguments = partition[(function | length) + 1:-1].split(',', 1) %}
+        {% set arguments = partition[partition.find('(') + 1:-1].split(',', 1) %}
         {% if arguments | length != 2 or not arguments[0] | trim or not arguments[1] | trim %}
           {{ exceptions.raise_compiler_error("Invalid partition transform '" ~ partition ~ "'") }}
         {% endif %}
@@ -181,7 +183,7 @@ else:
 {%- endmacro -%}
 
 {% macro python__tblproperties_clause() %}
-  {%- if config.get('file_format') != 'iceberg' -%}
+  {%- if (config.get('file_format') or 'iceberg') != 'iceberg' -%}
     {{ return('') }}
   {%- endif -%}
   {%- set tblproperties = spark__filtered_tblproperties(config.get('tblproperties')) -%}

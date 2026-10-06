@@ -3,7 +3,7 @@
 {%- endmacro -%}
 
 {% macro spark__tblproperties_clause() -%}
-  {%- if config.get('file_format', validator=validation.any[basestring]) != 'iceberg' -%}
+  {%- if (config.get('file_format', validator=validation.any[basestring]) or 'iceberg') != 'iceberg' -%}
     {{ return('') }}
   {%- endif -%}
   {%- set tblproperties = spark__filtered_tblproperties(config.get('tblproperties')) -%}
@@ -21,10 +21,8 @@
 {%- endmacro -%}
 
 {% macro spark__file_format_clause() %}
-  {%- set file_format = config.get('file_format', validator=validation.any[basestring]) -%}
-  {%- if file_format is not none %}
-    using {{ file_format }}
-  {%- endif %}
+  {%- set file_format = config.get('file_format', validator=validation.any[basestring]) or 'iceberg' -%}
+  using {{ file_format }}
 {%- endmacro -%}
 
 
@@ -172,7 +170,7 @@ writer = writer.option("location", target_location)
     {%- if temporary -%}
       {{ create_temporary_view(relation, compiled_code) }}
     {%- else -%}
-      {% if config.get('file_format', validator=validation.any[basestring]) in ['delta', 'iceberg'] %}
+      {% if (config.get('file_format', validator=validation.any[basestring]) or 'iceberg') in ['delta', 'iceberg'] %}
         create or replace table {{ relation }}
       {% else %}
         create table {{ relation }}
@@ -217,7 +215,7 @@ writer = writer.option("location", target_location)
 
 {% macro spark__persist_constraints(relation, model) %}
   {%- set contract_config = config.get('contract') -%}
-  {% if contract_config.enforced and config.get('file_format', 'delta') == 'delta' %}
+  {% if contract_config.enforced and (config.get('file_format') or 'iceberg') == 'delta' %}
     {% do alter_table_add_constraints(relation, model.constraints) %}
     {% do alter_column_set_constraints(relation, model.columns) %}
   {% endif %}

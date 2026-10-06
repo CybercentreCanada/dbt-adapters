@@ -1,5 +1,7 @@
 {% materialization streaming, adapter='spark', supported_languages=['sql', 'python'] %}
   {%- set language = model['language'] -%}
+    {%- set partition_file_format = config.get('file_format') or 'iceberg' -%}
+    {% do dbt_spark_validate_partition_by(config.get('partition_by'), partition_file_format, 'streaming', false, 'streaming') %}
   {%- set identifier = model['alias'] -%}
   {%- set grant_config = config.get('grants') -%}
   {%- set target_relation = api.Relation.create(identifier=identifier,
@@ -15,7 +17,7 @@
   {{ run_hooks(pre_hooks) }}
 
   {%- if old_relation is not none -%}
-    {% do adapter.check_partition_sync(target_relation, config.get('file_format'), config.get('partition_by')) %}
+    {% do adapter.check_partition_sync(target_relation, partition_file_format, config.get('partition_by')) %}
     {% do sync_tblproperties(target_relation, config.get('tblproperties')) %}
   {%- endif -%}
 
@@ -128,7 +130,7 @@ if not {{ dataframe }}.isStreaming:
 if not {{ target_exists }}:
     from pyspark.sql.functions import years, months, days, hours, bucket
 
-    writer = spark.createDataFrame([], {{ dataframe }}.schema).writeTo(target_name).using("{{ config.get('file_format', 'delta') }}")
+    writer = spark.createDataFrame([], {{ dataframe }}.schema).writeTo(target_name).using("{{ config.get('file_format') or 'iceberg' }}")
 {{ python__partitionedBy_clause() | indent(2, true) }}
 {% for option, value in (config.get('options') or {}).items() -%}
     writer = writer.option("{{ option }}", "{{ spark__escape_single_quotes(value) }}")
@@ -166,7 +168,7 @@ print(f"Started stream {target_name} (id={active_query.id}, checkpoint={checkpoi
     {%- if not write_stream_options is mapping -%}
         {{ exceptions.raise_compiler_error("write_stream_options must be a dictionary") }}
     {%- endif -%}
-    {%- if write_stream_options | length > 0 and config.get('file_format') != 'iceberg' -%}
+    {%- if write_stream_options | length > 0 and (config.get('file_format') or 'iceberg') != 'iceberg' -%}
         {{ exceptions.raise_compiler_error("write_stream_options are supported only for file_format='iceberg'") }}
     {%- endif -%}
     {%- for option, value in write_stream_options.items() -%}

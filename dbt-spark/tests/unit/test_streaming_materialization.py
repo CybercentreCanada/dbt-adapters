@@ -166,7 +166,7 @@ def test_streaming_materialization_creates_v2_sink_and_syncs_metadata():
     source = _source()
 
     assert "spark.createDataFrame([], {{ dataframe }}.schema).writeTo(target_name)" in source
-    assert ".using(\"{{ config.get('file_format', 'delta') }}\")" in source
+    assert ".using(\"{{ config.get('file_format') or 'iceberg' }}\")" in source
     assert "python__partitionedBy_clause" in source
     assert "python__tblproperties_clause" in source
     assert "adapter.check_partition_sync" in source

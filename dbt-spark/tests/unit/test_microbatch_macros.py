@@ -66,6 +66,92 @@ class TestMicrobatchMacros(unittest.TestCase):
         # only fires for the microbatch strategy). Should not raise.
         template.module.dbt_spark_validate_get_incremental_strategy("insert_overwrite", "parquet")
 
+    def test_validate_partition_by_accepts_plain_columns_and_iceberg_transforms(self):
+        template = self._get_template("materializations/incremental/validate.sql")
+        template.module.dbt_spark_validate_partition_by(
+            [
+                "region_code",
+                "years(event_time)",
+                "months(event_time)",
+                "days(event_time)",
+                "hours(event_time)",
+                "bucket(16, user_id)",
+                "truncate(4, region_code)",
+            ],
+            "iceberg",
+            "sql",
+        )
+
+    def test_validate_partition_by_accepts_plain_columns_for_non_iceberg(self):
+        template = self._get_template("materializations/incremental/validate.sql")
+        template.module.dbt_spark_validate_partition_by(["region_code"], "parquet", "sql")
+
+    def test_validate_partition_by_rejects_transforms_for_non_iceberg(self):
+        template = self._get_template("materializations/incremental/validate.sql")
+        with self.assertRaises(_CompilerError) as ctx:
+            template.module.dbt_spark_validate_partition_by(["hours(event_time)"], "parquet")
+        self.assertIn("only with file_format='iceberg'", str(ctx.exception))
+
+    def test_validate_partition_by_rejects_truncate_for_non_sql_writers(self):
+        template = self._get_template("materializations/incremental/validate.sql")
+        for writer in ("python", "streaming"):
+            with self.subTest(writer=writer), self.assertRaises(_CompilerError) as ctx:
+                template.module.dbt_spark_validate_partition_by(
+                    ["truncate(4, region_code)"], "iceberg", writer
+                )
+            self.assertIn("not supported by the " + writer + " writer", str(ctx.exception))
+
+    def test_validate_partition_by_rejects_invalid_transform(self):
+        template = self._get_template("materializations/incremental/validate.sql")
+        with self.assertRaises(_CompilerError) as ctx:
+            template.module.dbt_spark_validate_partition_by(["hour(event_time)"], "iceberg")
+        self.assertIn("hour(event_time)", str(ctx.exception))
+        self.assertIn("hours", str(ctx.exception))
+
+    def test_validate_partition_by_rejects_invalid_truncate_length(self):
+        template = self._get_template("materializations/incremental/validate.sql")
+        with self.assertRaises(_CompilerError):
+            template.module.dbt_spark_validate_partition_by(
+                ["truncate(0, region_code)"], "iceberg"
+            )
+
+    def test_validate_partition_by_requires_config_for_microbatch(self):
+        template = self._get_template("materializations/incremental/validate.sql")
+        with self.assertRaises(_CompilerError) as ctx:
+            template.module.dbt_spark_validate_partition_by(None, "iceberg", "sql", True)
+        self.assertIn("partition_by", str(ctx.exception))
+
+    def test_partition_validator_is_wired_to_each_partition_materialization(self):
+        sources = {
+            "table.sql": (
+                "src/dbt/include/spark/macros/materializations/table.sql",
+                "old_relation = adapter.get_relation",
+            ),
+            "incremental.sql": (
+                "src/dbt/include/spark/macros/materializations/incremental/incremental.sql",
+                "load_relation(this)",
+            ),
+            "streaming.sql": (
+                "src/dbt/include/spark/macros/materializations/streaming.sql",
+                "old_relation = adapter.get_relation",
+            ),
+            "seed.sql": (
+                "src/dbt/include/spark/macros/materializations/seed.sql",
+                "batch_size = get_batch_size()",
+            ),
+            "snapshot.sql": (
+                "src/dbt/include/spark/macros/materializations/snapshot.sql",
+                "get_or_create_relation(",
+            ),
+        }
+        for name, (path, first_branch) in sources.items():
+            with self.subTest(materialization=name), open(path) as source_file:
+                source = source_file.read()
+                self.assertLess(
+                    source.index("dbt_spark_validate_partition_by("),
+                    source.index(first_branch),
+                )
+
     # -- strategies.sql ------------------------------------------------------
 
     def test_strategies_microbatch_rejects_non_iceberg_file_format(self):
@@ -102,6 +188,10 @@ class TestMicrobatchMacros(unittest.TestCase):
             source,
         )
         gate = source.index("{%- if sync_metadata -%}")
+        self.assertLess(
+            source.index("dbt_spark_validate_partition_by(partition_by, file_format"),
+            source.index("sync_metadata ="),
+        )
         self.assertLess(gate, source.index("adapter.check_partition_sync"))
         self.assertLess(gate, source.index("sync_tblproperties(target_relation"))
         self.assertIn(

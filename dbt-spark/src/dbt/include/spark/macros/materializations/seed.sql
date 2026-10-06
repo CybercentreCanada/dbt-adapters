@@ -14,6 +14,7 @@
 
 {% macro spark__load_csv_rows(model, agate_table) %}
 
+  {% do dbt_spark_validate_partition_by(model['config'].get('partition_by'), model['config'].get('file_format') or 'iceberg', 'sql', false, 'seed') %}
   {% set batch_size = get_batch_size() %}
   {% set column_override = model['config'].get('column_types', {}) %}
 

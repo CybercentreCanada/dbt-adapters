@@ -1,7 +1,7 @@
 {% materialization incremental, adapter='spark', supported_languages=['sql', 'python'] -%}
   {% do spark__validate_streaming_options_config('incremental') %}
   {#-- Validate early so we don't run SQL if the file_format + strategy combo is invalid --#}
-  {%- set raw_file_format = config.get('file_format', default='parquet') -%}
+  {%- set raw_file_format = config.get('file_format') or 'iceberg' -%}
   {%- set raw_strategy = config.get('incremental_strategy') or 'append' -%}
   {%- set grant_config = config.get('grants') -%}
 
@@ -13,6 +13,7 @@
   {%- set unique_key = config.get('unique_key', none) -%}
   {%- set partition_by = config.get('partition_by', none) -%}
   {%- set language = model['language'] -%}
+  {% do dbt_spark_validate_partition_by(partition_by, file_format, 'python' if language == 'python' else 'sql', strategy == 'microbatch', 'incremental') %}
   {%- set on_schema_change = incremental_validate_on_schema_change(config.get('on_schema_change'), default='ignore') -%}
   {%- set incremental_predicates = config.get('predicates', none) or config.get('incremental_predicates', none) -%}
   {%- set target_relation = this -%}
