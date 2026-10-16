@@ -211,32 +211,29 @@ class TestSparkAdapter(unittest.TestCase):
 
         # Mimics the output of Spark with a DESCRIBE TABLE EXTENDED
         plain_rows = [
-            ("col1", "decimal(22,0)"),
-            (
-                "col2",
-                "string",
-            ),
-            ("dt", "date"),
-            ("struct_col", "struct<struct_inner_col:string>"),
-            ("# Partition Information", "data_type"),
-            ("# col_name", "data_type"),
-            ("dt", "date"),
-            (None, None),
-            ("# Detailed Table Information", None),
-            ("Database", None),
-            ("Owner", "root"),
-            ("Created Time", "Wed Feb 04 18:15:00 UTC 1815"),
-            ("Last Access", "Wed May 20 19:25:00 UTC 1925"),
-            ("Type", "MANAGED"),
-            ("Provider", "delta"),
-            ("Location", "/mnt/vo"),
-            ("Serde Library", "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe"),
-            ("InputFormat", "org.apache.hadoop.mapred.SequenceFileInputFormat"),
-            ("OutputFormat", "org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat"),
-            ("Partition Provider", "Catalog"),
+            ("col1", "decimal(22,0)", None),
+            ("col2", "string", None),
+            ("dt", "date", None),
+            ("struct_col", "struct<struct_inner_col:string>", None),
+            ("# Partition Information", "data_type", None),
+            ("# col_name", "data_type", None),
+            ("dt", "date", None),
+            (None, None, None),
+            ("# Detailed Table Information", None, None),
+            ("Database", None, None),
+            ("Owner", "root", None),
+            ("Created Time", "Wed Feb 04 18:15:00 UTC 1815", None),
+            ("Last Access", "Wed May 20 19:25:00 UTC 1925", None),
+            ("Type", "MANAGED", None),
+            ("Provider", "delta", None),
+            ("Location", "/mnt/vo", None),
+            ("Serde Library", "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe", None),
+            ("InputFormat", "org.apache.hadoop.mapred.SequenceFileInputFormat", None),
+            ("OutputFormat", "org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat", None),
+            ("Partition Provider", "Catalog", None),
         ]
 
-        input_cols = [Row(keys=["col_name", "data_type"], values=r) for r in plain_rows]
+        input_cols = [Row(keys=["col_name", "data_type", "comment"], values=r) for r in plain_rows]
 
         rows = SparkAdapter(self.target_http, get_context("spawn")).parse_describe_extended(
             relation, input_cols
@@ -256,6 +253,7 @@ class TestSparkAdapter(unittest.TestCase):
                 "numeric_scale": None,
                 "numeric_precision": None,
                 "char_size": None,
+                "comment": None,
             },
         )
 
@@ -273,6 +271,7 @@ class TestSparkAdapter(unittest.TestCase):
                 "numeric_scale": None,
                 "numeric_precision": None,
                 "char_size": None,
+                "comment": None,
             },
         )
 
@@ -290,6 +289,7 @@ class TestSparkAdapter(unittest.TestCase):
                 "numeric_scale": None,
                 "numeric_precision": None,
                 "char_size": None,
+                "comment": None,
             },
         )
 
@@ -307,6 +307,7 @@ class TestSparkAdapter(unittest.TestCase):
                 "numeric_scale": None,
                 "numeric_precision": None,
                 "char_size": None,
+                "comment": None,
             },
         )
 
@@ -321,12 +322,12 @@ class TestSparkAdapter(unittest.TestCase):
 
         # Mimics the output of Spark with a DESCRIBE TABLE EXTENDED
         plain_rows = [
-            ("col1", "decimal(22,0)"),
-            ("# Detailed Table Information", None),
-            ("Owner", 1234),
+            ("col1", "decimal(22,0)", None),
+            ("# Detailed Table Information", None, None),
+            ("Owner", 1234, None),
         ]
 
-        input_cols = [Row(keys=["col_name", "data_type"], values=r) for r in plain_rows]
+        input_cols = [Row(keys=["col_name", "data_type", "comment"], values=r) for r in plain_rows]
 
         rows = SparkAdapter(self.target_http, get_context("spawn")).parse_describe_extended(
             relation, input_cols
@@ -345,25 +346,25 @@ class TestSparkAdapter(unittest.TestCase):
 
         # Mimics the output of Spark with a DESCRIBE TABLE EXTENDED
         plain_rows = [
-            ("col1", "decimal(22,0)"),
-            ("# Partition Information", "data_type"),
-            (None, None),
-            ("# Detailed Table Information", None),
-            ("Database", None),
-            ("Owner", "root"),
-            ("Created Time", "Wed Feb 04 18:15:00 UTC 1815"),
-            ("Last Access", "Wed May 20 19:25:00 UTC 1925"),
-            ("Statistics", "1109049927 bytes, 14093476 rows"),
-            ("Type", "MANAGED"),
-            ("Provider", "delta"),
-            ("Location", "/mnt/vo"),
-            ("Serde Library", "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe"),
-            ("InputFormat", "org.apache.hadoop.mapred.SequenceFileInputFormat"),
-            ("OutputFormat", "org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat"),
-            ("Partition Provider", "Catalog"),
+            ("col1", "decimal(22,0)", None),
+            ("# Partition Information", "data_type", None),
+            (None, None, None),
+            ("# Detailed Table Information", None, None),
+            ("Database", None, None),
+            ("Owner", "root", None),
+            ("Created Time", "Wed Feb 04 18:15:00 UTC 1815", None),
+            ("Last Access", "Wed May 20 19:25:00 UTC 1925", None),
+            ("Statistics", "1109049927 bytes, 14093476 rows", None),
+            ("Type", "MANAGED", None),
+            ("Provider", "delta", None),
+            ("Location", "/mnt/vo", None),
+            ("Serde Library", "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe", None),
+            ("InputFormat", "org.apache.hadoop.mapred.SequenceFileInputFormat", None),
+            ("OutputFormat", "org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat", None),
+            ("Partition Provider", "Catalog", None),
         ]
 
-        input_cols = [Row(keys=["col_name", "data_type"], values=r) for r in plain_rows]
+        input_cols = [Row(keys=["col_name", "data_type", "comment"], values=r) for r in plain_rows]
 
         rows = SparkAdapter(self.target_http, get_context("spawn")).parse_describe_extended(
             relation, input_cols
@@ -383,6 +384,7 @@ class TestSparkAdapter(unittest.TestCase):
                 "numeric_scale": None,
                 "numeric_precision": None,
                 "char_size": None,
+                "comment": None,
                 "stats:bytes:description": "",
                 "stats:bytes:include": True,
                 "stats:bytes:label": "bytes",
@@ -398,9 +400,11 @@ class TestSparkAdapter(unittest.TestCase):
         adapter = SparkAdapter(self.target_http, get_context("spawn"))
         # fine
         adapter.Relation.create(schema="different", identifier="table")
-        with self.assertRaises(DbtRuntimeError):
-            # not fine - database set
-            adapter.Relation.create(database="something", schema="different", identifier="table")
+        # CCCS: database is now allowed on SparkRelation (cross-database/catalog support)
+        relation = adapter.Relation.create(
+            database="something", schema="different", identifier="table"
+        )
+        self.assertEqual(relation.database, "something")
 
     def test_profile_with_database(self):
         profile = {
@@ -493,6 +497,7 @@ class TestSparkAdapter(unittest.TestCase):
                 "numeric_scale": None,
                 "numeric_precision": None,
                 "char_size": None,
+                "comment": None,
                 "stats:bytes:description": "",
                 "stats:bytes:include": True,
                 "stats:bytes:label": "bytes",
@@ -514,6 +519,7 @@ class TestSparkAdapter(unittest.TestCase):
                 "numeric_scale": None,
                 "numeric_precision": None,
                 "char_size": None,
+                "comment": None,
                 "stats:bytes:description": "",
                 "stats:bytes:include": True,
                 "stats:bytes:label": "bytes",
@@ -579,6 +585,7 @@ class TestSparkAdapter(unittest.TestCase):
                 "numeric_scale": None,
                 "numeric_precision": None,
                 "char_size": None,
+                "comment": None,
             },
         )
 
@@ -596,6 +603,7 @@ class TestSparkAdapter(unittest.TestCase):
                 "numeric_scale": None,
                 "numeric_precision": None,
                 "char_size": None,
+                "comment": None,
             },
         )
 
@@ -647,6 +655,7 @@ class TestSparkAdapter(unittest.TestCase):
                 "numeric_scale": None,
                 "numeric_precision": None,
                 "char_size": None,
+                "comment": None,
                 "stats:bytes:description": "",
                 "stats:bytes:include": True,
                 "stats:bytes:label": "bytes",
@@ -672,6 +681,7 @@ class TestSparkAdapter(unittest.TestCase):
                 "numeric_scale": None,
                 "numeric_precision": None,
                 "char_size": None,
+                "comment": None,
                 "stats:bytes:description": "",
                 "stats:bytes:include": True,
                 "stats:bytes:label": "bytes",
@@ -836,11 +846,11 @@ class TestGetColumnsForCatalogIcebergFallback(unittest.TestCase):
         return SparkAdapter(self.target_http, get_context("spawn"))
 
     def test_falls_back_to_get_columns_in_relation(self):
-        """When parse_columns_from_information returns nothing (Iceberg v2 path),
+        """When parse_columns_from_information returns nothing,
         _get_columns_for_catalog should fall back to get_columns_in_relation."""
         adapter = self._make_adapter()
 
-        # Iceberg v2 information string: no ' |-- col: type (nullable = ...)' lines,
+        # Information string with no ' |-- col: type (nullable = ...)' lines,
         # so parse_columns_from_information will return an empty list.
         information = "id: int\n" "name: string\n" "Provider: iceberg\n" "Owner: root\n"
         relation = SparkRelation.create(
@@ -848,7 +858,6 @@ class TestGetColumnsForCatalogIcebergFallback(unittest.TestCase):
             identifier="orders",
             type=SparkRelation.get_relation_type.Table,
             information=information,
-            is_iceberg=True,
         )
 
         fallback_columns = [
@@ -922,7 +931,6 @@ class TestGetColumnsForCatalogIcebergFallback(unittest.TestCase):
             identifier="orders",
             type=SparkRelation.get_relation_type.Table,
             information="Provider: iceberg\n",
-            is_iceberg=True,
         )
 
         with mock.patch.object(

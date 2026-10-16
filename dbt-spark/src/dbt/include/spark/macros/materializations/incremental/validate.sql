@@ -35,6 +35,12 @@
     Use the 'append' or 'merge' strategy instead
   {%- endset %}
 
+  {% set invalid_microbatch_file_format_msg -%}
+    Invalid file_format provided for the 'microbatch' incremental strategy: {{ file_format }}
+    dbt-spark only supports 'microbatch' when file_format is set to 'iceberg'.
+    Iceberg's snapshot-isolated INSERT OVERWRITE is required for safe parallel batch execution.
+  {%- endset %}
+
   {% if raw_strategy not in ['append', 'merge', 'insert_overwrite', 'microbatch'] %}
     {% do exceptions.raise_compiler_error(invalid_strategy_msg) %}
   {%-else %}
@@ -43,6 +49,9 @@
     {% endif %}
     {% if raw_strategy in ['insert_overwrite', 'microbatch'] and target.endpoint %}
       {% do exceptions.raise_compiler_error(invalid_insert_overwrite_endpoint_msg) %}
+    {% endif %}
+    {% if raw_strategy == 'microbatch' and file_format != 'iceberg' %}
+      {% do exceptions.raise_compiler_error(invalid_microbatch_file_format_msg) %}
     {% endif %}
   {% endif %}
 

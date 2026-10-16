@@ -21,10 +21,13 @@ class TestSparkMacros(unittest.TestCase):
             "config": mock.Mock(),
             "adapter": mock.Mock(),
             "return": lambda r: r,
+            "spark__filtered_tblproperties": lambda props: props if props else None,
+            "spark__escape_single_quotes": lambda expr: expr,
         }
         self.default_context["config"].get = lambda key, default=None, **kwargs: self.config.get(
             key, default
         )
+        self.default_context["adapter"].behavior.require_location_root = False
 
     def __get_template(self, template_filename):
         return self.jinja_env.get_template(template_filename, globals=self.default_context)
