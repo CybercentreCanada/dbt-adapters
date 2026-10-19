@@ -2,6 +2,7 @@ import os
 import re
 from concurrent.futures import Future
 from dataclasses import dataclass
+from multiprocessing.context import SpawnContext
 from typing import (
     Any,
     Dict,
@@ -29,6 +30,7 @@ if TYPE_CHECKING:
     # Indirectly imported via agate_helper, which is lazy loaded further downfile.
     # Used by mypy for earlier type hints.
     import agate
+    from pyspark.sql import SparkSession
 
 from dbt.adapters.base import AdapterConfig, PythonJobHelper
 from dbt.adapters.base.impl import catch_as_completed, ConstraintSupport
@@ -37,6 +39,7 @@ from dbt.adapters.sql import SQLAdapter
 from dbt.adapters.spark import SparkConnectionManager
 from dbt.adapters.spark import SparkRelation
 from dbt.adapters.spark import SparkColumn
+from dbt.adapters.spark.connections import SparkConnectionMethod
 from dbt.adapters.spark.relation_configs.tblproperties import (
     TblPropertiesDiff,
     TblPropertiesProcessor,
@@ -85,6 +88,16 @@ USE_V2_RELATION_LISTING = {
         "for listing relations, which is compatible with Iceberg v2 tables. Falls back to "
         "SHOW TABLE EXTENDED (v1) on failure. Disable for legacy Spark catalogs that do not "
         "support v2 table listing."
+    ),
+}
+
+ICEBERG_LISTING_FAST = {
+    "name": "iceberg_listing_fast",
+    "default": True,
+    "description": (
+        "When enabled alongside use_v2_relation_listing, dbt lists persistent relations "
+        "in Iceberg-only session catalogs with SHOW TABLES and SHOW VIEWS, without "
+        "per-table DESCRIBE. Disable to use the existing v2-first relation listing."
     ),
 }
 
@@ -141,6 +154,8 @@ TABLE_OR_VIEW_NOT_FOUND_MESSAGES = (
     "NoSuchTableException",
 )
 
+_ICEBERG_ONLY_CATALOG_CLASSES = ("org.apache.iceberg.spark.SparkCatalog",)
+
 
 @dataclass
 class SparkConfig(AdapterConfig):
@@ -155,6 +170,10 @@ class SparkConfig(AdapterConfig):
 
 
 class SparkAdapter(SQLAdapter):
+    def __init__(self, config, mp_context: SpawnContext) -> None:
+        super().__init__(config, mp_context)
+        self._catalog_class_cache: Dict[Tuple["SparkSession", str], bool] = {}
+
     COLUMN_NAMES = (
         "table_database",
         "table_schema",
@@ -223,6 +242,7 @@ class SparkAdapter(SQLAdapter):
             CHECK_PARTITION_SYNC,
             CHECK_PARTITION_SYNC_RAISES,
             USE_V2_RELATION_LISTING,
+            ICEBERG_LISTING_FAST,
             SET_PARTITION_OVERWRITE_MODE,
             REQUIRE_LOCATION_ROOT,
         ]
@@ -303,7 +323,13 @@ class SparkAdapter(SQLAdapter):
                 DESCRIBE_TABLE_EXTENDED_MACRO_NAME, kwargs={"table_name": table_name}
             )
         except DbtRuntimeError as e:
-            logger.debug(f"Error while retrieving information about {table_name}: {e.msg}")
+            errmsg = getattr(e, "msg", "")
+            if not any(
+                msg in errmsg
+                for msg in SCHEMA_NOT_FOUND_MESSAGES + TABLE_OR_VIEW_NOT_FOUND_MESSAGES
+            ):
+                raise
+            logger.debug(f"Error while retrieving information about {table_name}: {errmsg}")
             table_results = AttrDict()
 
         information = ""
@@ -366,6 +392,8 @@ class SparkAdapter(SQLAdapter):
         """Distinct Spark compute engines may not support the same SQL featureset. Thus, we must
         try different methods to fetch relation information.
 
+        With iceberg_listing_fast and use_v2_relation_listing enabled, Iceberg-only session
+        catalogs use SHOW TABLES and SHOW VIEWS without per-table DESCRIBE.
         By default (use_v2_relation_listing=True), uses SHOW TABLES + DESCRIBE EXTENDED (v2)
         which works with Iceberg v2 tables. Falls back to SHOW TABLE EXTENDED (v1) on failure.
 
@@ -375,10 +403,100 @@ class SparkAdapter(SQLAdapter):
 
         kwargs = {"schema_relation": schema_relation}
 
+        if (
+            self.behavior.use_v2_relation_listing
+            and self.behavior.iceberg_listing_fast
+            and self._catalog_is_iceberg_only(schema_relation.database)
+        ):
+            return self._list_relations_fast(schema_relation)
+
         if self.behavior.use_v2_relation_listing:
             return self._list_relations_v2_first(kwargs, schema_relation)
         else:
             return self._list_relations_v1_first(kwargs, schema_relation)
+
+    def _catalog_is_iceberg_only(self, catalog: Optional[str]) -> bool:
+        """Check whether a Spark catalog is implemented by the Iceberg SparkCatalog."""
+        if self.config.credentials.method != SparkConnectionMethod.SESSION:
+            return False
+
+        try:
+            from dbt.adapters.spark.session import get_spark_session
+
+            spark = get_spark_session(self.config.credentials.server_side_parameters)
+            catalog = catalog or spark.catalog.currentCatalog()
+        except Exception as e:
+            logger.debug(f"catalog class check could not obtain the configured Spark session: {e}")
+            return False
+
+        cache_key = (spark, catalog)
+        if cache_key not in self._catalog_class_cache:
+            catalog_class = None
+            try:
+                catalog_class = spark.conf.get(f"spark.sql.catalog.{catalog}")
+            except Exception as e:
+                logger.debug(f"catalog configuration lookup failed for {catalog}: {e}")
+            if catalog_class is None:
+                try:
+                    catalog_class = (
+                        spark._jsparkSession.sessionState()
+                        .catalogManager()
+                        .catalog(catalog)
+                        .getClass()
+                        .getName()
+                    )
+                except Exception as e:
+                    logger.debug(f"catalog class check failed for {catalog}: {e}")
+                    return False
+            if catalog_class is None:
+                logger.debug(f"catalog class is unknown for {catalog}")
+                return False
+            self._catalog_class_cache[cache_key] = catalog_class in _ICEBERG_ONLY_CATALOG_CLASSES
+
+        return self._catalog_class_cache[cache_key]
+
+    def _list_relations_fast(self, schema_relation: BaseRelation) -> List[BaseRelation]:
+        """List Iceberg tables and views using two SHOW statements, without DESCRIBE."""
+        try:
+            _, tables = self.execute(f"show tables in {schema_relation} like '*'", fetch=True)
+            _, views = self.execute(f"show views in {schema_relation} like '*'", fetch=True)
+        except DbtRuntimeError as e:
+            errmsg = getattr(e, "msg", "")
+            if any(msg in errmsg for msg in SCHEMA_NOT_FOUND_MESSAGES):
+                return []
+            raise
+
+        table_rows = [row for row in tables if not row[2]]
+        view_rows = [row for row in views if not row[2]]
+        view_identifiers = {(row[0], row[1]) for row in view_rows}
+        relations: List[BaseRelation] = [
+            self.Relation.create(
+                database=schema_relation.database,
+                schema=schema_relation.schema,
+                identifier=row[1],
+                type=RelationType.Table,
+                information="",
+                is_delta=False,
+                is_hudi=False,
+                is_iceberg=True,
+            )
+            for row in table_rows
+            if (row[0], row[1]) not in view_identifiers
+        ]
+        relations.extend(
+            self.Relation.create(
+                database=schema_relation.database,
+                schema=schema_relation.schema,
+                identifier=row[1],
+                type=RelationType.View,
+                information="",
+                is_delta=False,
+                is_hudi=False,
+                is_iceberg=False,
+            )
+            for row in view_rows
+        )
+        return relations
 
     # CCCS v2-first: uses SHOW TABLES + DESCRIBE EXTENDED, falls back to SHOW TABLE EXTENDED
     def _list_relations_v2_first(

@@ -1,0 +1,6 @@
+kind: Under the Hood
+body: Speed up persistent Iceberg relation listing without per-table DESCRIBE, controlled by the default-enabled iceberg_listing_fast behavior flag instead of the ICEBERG_LISTING_FAST environment variable; use the configured Spark session for catalog detection, exclude temporary views, and create Iceberg snapshot staging views as session-local temporary views
+time: 2026-10-16T15:28:05.316000-04:00
+custom:
+  Author: yren
+  Issue: "0"

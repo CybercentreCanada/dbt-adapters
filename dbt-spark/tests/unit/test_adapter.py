@@ -1,8 +1,8 @@
 import unittest
-import pytest
 from multiprocessing import get_context
 from unittest import mock
 
+import pytest
 from dbt_common.exceptions import DbtRuntimeError
 from agate import Row
 from pyhive import hive
@@ -12,6 +12,8 @@ from dbt.adapters.spark.impl import (
     SCHEMA_NOT_FOUND_MESSAGES,
     TABLE_OR_VIEW_NOT_FOUND_MESSAGES,
 )
+from dbt.adapters.spark.connections import SparkConnectionMethod
+from dbt.adapters.contracts.relation import RelationType
 from .utils import config_from_parts_or_dicts
 
 ENFORCED_SPARK_CONFIG = {"spark.sql.ansi.enabled": "false"}
@@ -699,8 +701,9 @@ class TestListRelationsWithoutCaching(unittest.TestCase):
     def set_up_fixtures(self, target_http):
         self.target_http = target_http
 
-    def _make_adapter(self):
-        return SparkAdapter(self.target_http, get_context("spawn"))
+    def _make_adapter(self, flags=None):
+        with mock.patch.object(self.target_http, "flags", flags or {}, create=True):
+            return SparkAdapter(self.target_http, get_context("spawn"))
 
     def _make_schema_relation(self, adapter, schema="analytics"):
         return adapter.Relation.create(schema=schema, identifier="").without_identifier()
@@ -733,6 +736,297 @@ class TestListRelationsWithoutCaching(unittest.TestCase):
         ):
             result = adapter.list_relations_without_caching(schema_relation)
             self.assertEqual(result, [])
+
+    def test_fast_listing_dispatches_for_iceberg_catalog(self):
+        adapter = self._make_adapter()
+        schema_relation = self._make_schema_relation(adapter)
+
+        self.assertTrue(adapter.behavior.iceberg_listing_fast)
+        with mock.patch.object(adapter, "_catalog_is_iceberg_only", return_value=True):
+            with mock.patch.object(
+                adapter, "_list_relations_fast", return_value=[]
+            ) as fast_listing:
+                adapter.list_relations_without_caching(schema_relation)
+
+        fast_listing.assert_called_once_with(schema_relation)
+
+    def test_fast_listing_can_be_disabled(self):
+        adapter = self._make_adapter({"iceberg_listing_fast": False})
+        schema_relation = self._make_schema_relation(adapter)
+
+        self.assertFalse(adapter.behavior.iceberg_listing_fast)
+        with mock.patch.object(adapter, "_catalog_is_iceberg_only") as is_iceberg:
+            with mock.patch.object(
+                adapter, "_list_relations_v2_first", return_value=[]
+            ) as regular_listing:
+                with mock.patch.object(adapter, "_list_relations_fast") as fast_listing:
+                    adapter.list_relations_without_caching(schema_relation)
+
+        is_iceberg.assert_not_called()
+        fast_listing.assert_not_called()
+        regular_listing.assert_called_once()
+
+    def test_fast_listing_respects_v2_behavior_flag(self):
+        adapter = self._make_adapter(
+            {"iceberg_listing_fast": True, "use_v2_relation_listing": False}
+        )
+        schema_relation = self._make_schema_relation(adapter)
+
+        with mock.patch.object(
+            adapter, "_catalog_is_iceberg_only", return_value=True
+        ) as is_iceberg:
+            with mock.patch.object(
+                adapter, "_list_relations_v1_first", return_value=[]
+            ) as regular_listing:
+                with mock.patch.object(adapter, "_list_relations_fast") as fast_listing:
+                    adapter.list_relations_without_caching(schema_relation)
+
+        is_iceberg.assert_not_called()
+        fast_listing.assert_not_called()
+        regular_listing.assert_called_once()
+
+    def test_old_environment_switch_does_not_disable_fast_listing(self):
+        adapter = self._make_adapter({"iceberg_listing_fast": True})
+        schema_relation = self._make_schema_relation(adapter)
+        with mock.patch.dict("os.environ", {"ICEBERG_LISTING_FAST": "0"}):
+            with mock.patch.object(adapter, "_catalog_is_iceberg_only", return_value=True):
+                with mock.patch.object(
+                    adapter, "_list_relations_fast", return_value=[]
+                ) as fast_listing:
+                    adapter.list_relations_without_caching(schema_relation)
+        fast_listing.assert_called_once_with(schema_relation)
+
+    def test_fast_listing_builds_tables_and_views_without_describe(self):
+        adapter = self._make_adapter()
+        schema_relation = adapter.Relation.create(
+            database="iceberg_catalog", schema="analytics", identifier=""
+        ).without_identifier()
+        tables = [
+            ("analytics", "iceberg_table", False),
+            ("analytics", "shared_name", False),
+            ("", "temporary_table", True),
+        ]
+        views = [
+            ("analytics", "shared_name", False),
+            ("analytics", "iceberg_view", False),
+            ("", "iceberg_table", True),
+            ("", "temporary_view", True),
+        ]
+
+        with mock.patch.object(
+            adapter, "execute", side_effect=[(None, tables), (None, views)]
+        ) as execute:
+            relations = adapter._list_relations_fast(schema_relation)
+
+        execute.assert_has_calls(
+            [
+                mock.call(f"show tables in {schema_relation} like '*'", fetch=True),
+                mock.call(f"show views in {schema_relation} like '*'", fetch=True),
+            ]
+        )
+        self.assertEqual(execute.call_count, 2)
+        self.assertEqual(
+            [relation.identifier for relation in relations],
+            ["iceberg_table", "shared_name", "iceberg_view"],
+        )
+        self.assertEqual(
+            [relation.type for relation in relations],
+            [RelationType.Table, RelationType.View, RelationType.View],
+        )
+        self.assertTrue(relations[0].is_iceberg)
+        self.assertFalse(relations[1].is_iceberg)
+        self.assertTrue(all(relation.database == "iceberg_catalog" for relation in relations))
+        self.assertTrue(all(relation.schema == "analytics" for relation in relations))
+
+    def test_fast_listing_returns_empty_for_missing_schema(self):
+        adapter = self._make_adapter()
+        schema_relation = self._make_schema_relation(adapter)
+
+        for not_found_msg in SCHEMA_NOT_FOUND_MESSAGES:
+            with self.subTest(not_found_msg=not_found_msg):
+                with mock.patch.object(
+                    adapter, "execute", side_effect=DbtRuntimeError(not_found_msg)
+                ):
+                    self.assertEqual(adapter._list_relations_fast(schema_relation), [])
+
+    def test_fast_listing_propagates_unexpected_error(self):
+        adapter = self._make_adapter()
+        schema_relation = self._make_schema_relation(adapter)
+
+        with mock.patch.object(
+            adapter, "execute", side_effect=DbtRuntimeError("Connection failed")
+        ):
+            with self.assertRaises(DbtRuntimeError):
+                adapter._list_relations_fast(schema_relation)
+
+    def test_describe_not_found_returns_empty_information(self):
+        adapter = self._make_adapter()
+        schema_relation = adapter.Relation.create(
+            database="iceberg_catalog", schema="analytics", identifier=""
+        ).without_identifier()
+
+        with mock.patch.object(
+            adapter,
+            "execute_macro",
+            side_effect=DbtRuntimeError("[TABLE_OR_VIEW_NOT_FOUND]"),
+        ):
+            result = adapter._get_relation_information_using_describe(
+                ("analytics", "missing_table", False), schema_relation
+            )
+
+        self.assertEqual(result, ("analytics", "missing_table", ""))
+
+    def test_describe_propagates_unexpected_error(self):
+        adapter = self._make_adapter()
+        schema_relation = self._make_schema_relation(adapter)
+
+        with mock.patch.object(
+            adapter, "execute_macro", side_effect=DbtRuntimeError("Connection failed")
+        ):
+            with self.assertRaises(DbtRuntimeError):
+                adapter._get_relation_information_using_describe(
+                    ("analytics", "existing_table", False), schema_relation
+                )
+
+
+@pytest.fixture
+def session_listing_adapter(target_http):
+    adapter = SparkAdapter(target_http, get_context("spawn"))
+    with mock.patch.object(adapter.config.credentials, "method", SparkConnectionMethod.SESSION):
+        yield adapter
+
+
+def test_catalog_class_detection_is_cached(session_listing_adapter):
+    spark = mock.Mock()
+    spark.conf.get.return_value = "org.apache.iceberg.spark.SparkCatalog"
+    with mock.patch(
+        "dbt.adapters.spark.session.get_spark_session", return_value=spark
+    ) as get_session:
+        assert session_listing_adapter._catalog_is_iceberg_only("polaris")
+        assert session_listing_adapter._catalog_is_iceberg_only("polaris")
+
+    spark.conf.get.assert_called_once_with("spark.sql.catalog.polaris")
+    get_session.assert_called_with(
+        session_listing_adapter.config.credentials.server_side_parameters
+    )
+
+
+def test_catalog_class_detection_uses_current_catalog(session_listing_adapter):
+    spark = mock.Mock()
+    spark.catalog.currentCatalog.return_value = "polaris"
+    spark.conf.get.return_value = "org.apache.iceberg.spark.SparkCatalog"
+    with mock.patch("dbt.adapters.spark.session.get_spark_session", return_value=spark):
+        assert session_listing_adapter._catalog_is_iceberg_only(None)
+    spark.conf.get.assert_called_once_with("spark.sql.catalog.polaris")
+
+
+def test_catalog_class_detection_uses_jvm_fallback(session_listing_adapter):
+    spark = mock.Mock()
+    spark.conf.get.side_effect = RuntimeError("Configuration not set")
+    catalog = spark._jsparkSession.sessionState().catalogManager().catalog.return_value
+    catalog.getClass().getName.return_value = "org.apache.iceberg.spark.SparkCatalog"
+    with mock.patch("dbt.adapters.spark.session.get_spark_session", return_value=spark):
+        assert session_listing_adapter._catalog_is_iceberg_only("polaris")
+
+
+def test_unknown_catalog_class_is_not_cached(session_listing_adapter):
+    spark = mock.Mock()
+    spark.conf.get.side_effect = [
+        RuntimeError("Configuration unavailable"),
+        "org.apache.iceberg.spark.SparkCatalog",
+    ]
+    spark._jsparkSession.sessionState.side_effect = RuntimeError("Catalog unavailable")
+    with mock.patch("dbt.adapters.spark.session.get_spark_session", return_value=spark):
+        assert not session_listing_adapter._catalog_is_iceberg_only("polaris")
+        assert session_listing_adapter._catalog_class_cache == {}
+        assert session_listing_adapter._catalog_is_iceberg_only("polaris")
+
+
+def test_catalog_class_cache_does_not_cross_sessions(session_listing_adapter):
+    iceberg_session = mock.Mock()
+    iceberg_session.conf.get.return_value = "org.apache.iceberg.spark.SparkCatalog"
+    other_session = mock.Mock()
+    other_session.conf.get.return_value = "org.apache.iceberg.spark.SparkSessionCatalog"
+    with mock.patch(
+        "dbt.adapters.spark.session.get_spark_session",
+        side_effect=[iceberg_session, other_session, iceberg_session],
+    ):
+        assert session_listing_adapter._catalog_is_iceberg_only("polaris")
+        assert not session_listing_adapter._catalog_is_iceberg_only("polaris")
+        assert session_listing_adapter._catalog_is_iceberg_only("polaris")
+    iceberg_session.conf.get.assert_called_once()
+    other_session.conf.get.assert_called_once()
+
+
+def test_catalog_class_cache_does_not_cross_adapters(session_listing_adapter):
+    spark = mock.Mock()
+    spark.conf.get.side_effect = [
+        "org.apache.iceberg.spark.SparkCatalog",
+        "org.apache.iceberg.spark.SparkSessionCatalog",
+    ]
+    other_adapter = SparkAdapter(session_listing_adapter.config, get_context("spawn"))
+    with mock.patch("dbt.adapters.spark.session.get_spark_session", return_value=spark):
+        assert session_listing_adapter._catalog_is_iceberg_only("polaris")
+        assert not other_adapter._catalog_is_iceberg_only("polaris")
+
+
+def test_catalog_detection_does_not_create_local_session_for_remote_connections(target_http):
+    adapter = SparkAdapter(target_http, get_context("spawn"))
+    with mock.patch("dbt.adapters.spark.session.get_spark_session") as get_session:
+        assert not adapter._catalog_is_iceberg_only("polaris")
+    get_session.assert_not_called()
+
+
+def test_catalog_detection_session_failure_uses_existing_listing(session_listing_adapter):
+    with mock.patch(
+        "dbt.adapters.spark.session.get_spark_session",
+        side_effect=RuntimeError("Session unavailable"),
+    ):
+        assert not session_listing_adapter._catalog_is_iceberg_only("polaris")
+    assert session_listing_adapter._catalog_class_cache == {}
+
+
+def test_fast_listing_preserves_namespace_identity(target_http):
+    adapter = SparkAdapter(target_http, get_context("spawn"))
+    schema_relation = adapter.Relation.create(
+        database="polaris", schema="parent.child", identifier=""
+    ).without_identifier()
+    with mock.patch.object(
+        adapter,
+        "execute",
+        side_effect=[
+            (None, [("`parent`.`child`", "orders", False)]),
+            (None, [("`parent`.`child`", "report", False)]),
+        ],
+    ):
+        relations = adapter._list_relations_fast(schema_relation)
+    assert [relation.schema for relation in relations] == ["parent.child", "parent.child"]
+
+
+@pytest.mark.parametrize("statement", [0, 1])
+@pytest.mark.parametrize("message", ["Permission denied", "[TABLE_OR_VIEW_NOT_FOUND]"])
+def test_fast_listing_errors_propagate(target_http, statement, message):
+    adapter = SparkAdapter(target_http, get_context("spawn"))
+    schema_relation = adapter.Relation.create(schema="analytics").without_identifier()
+    with mock.patch.object(
+        adapter, "execute", side_effect=[(None, [])] * statement + [DbtRuntimeError(message)]
+    ):
+        with pytest.raises(DbtRuntimeError) as error:
+            adapter._list_relations_fast(schema_relation)
+    assert error.value.msg == message
+
+
+@pytest.mark.parametrize("statement", [0, 1])
+def test_fast_listing_missing_schema_returns_no_partial_results(target_http, statement):
+    adapter = SparkAdapter(target_http, get_context("spawn"))
+    schema_relation = adapter.Relation.create(schema="analytics").without_identifier()
+    with mock.patch.object(
+        adapter,
+        "execute",
+        side_effect=[(None, [("analytics", "orders", False)])] * statement
+        + [DbtRuntimeError("[SCHEMA_NOT_FOUND]")],
+    ):
+        assert adapter._list_relations_fast(schema_relation) == []
 
 
 @pytest.mark.parametrize("not_found_msg", SCHEMA_NOT_FOUND_MESSAGES)

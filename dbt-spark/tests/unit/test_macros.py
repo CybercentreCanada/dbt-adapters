@@ -2,6 +2,8 @@ import unittest
 from unittest import mock
 import re
 from jinja2 import Environment, FileSystemLoader
+from dbt.adapters.spark import SparkRelation
+from dbt_common.clients.jinja import MaterializationExtension
 
 
 class TestSparkMacros(unittest.TestCase):
@@ -10,6 +12,7 @@ class TestSparkMacros(unittest.TestCase):
             loader=FileSystemLoader("src/dbt/include/spark/macros"),
             extensions=[
                 "jinja2.ext.do",
+                MaterializationExtension,
             ],
         )
 
@@ -45,6 +48,65 @@ class TestSparkMacros(unittest.TestCase):
 
     def test_macros_load(self):
         self.jinja_env.get_template("adapters.sql")
+
+    def test_iceberg_snapshot_staging_uses_local_temporary_view(self):
+        statements, relations = self._render_snapshot_staging(is_iceberg=True)
+        self.assertEqual(
+            re.sub(r"\s+", " ", statements[0]).strip(),
+            "create or replace temporary view snapshot__dbt_tmp as select 1 as id",
+        )
+        self.assertIsNone(relations[0].database)
+        self.assertIsNone(relations[0].schema)
+
+    def test_non_iceberg_snapshot_staging_keeps_permanent_view(self):
+        statements, relations = self._render_snapshot_staging(is_iceberg=False)
+        self.assertEqual(
+            re.sub(r"\s+", " ", statements[0]).strip(),
+            "create or replace view analytics.snapshot__dbt_tmp as select 1 as id",
+        )
+        self.assertIsNone(relations[0].database)
+        self.assertEqual(relations[0].schema, "analytics")
+
+    def _render_snapshot_staging(self, is_iceberg):
+        target = SparkRelation.create(
+            database="polaris", schema="analytics", identifier="snapshot", is_iceberg=is_iceberg
+        )
+        statements = []
+        relations = []
+        self.default_context["config"].persist_column_docs.return_value = False
+        context = {
+            **self.default_context,
+            "api": mock.Mock(Relation=SparkRelation),
+            "snapshot_staging_table": lambda *args: "select 1 as id",
+            "statement": lambda name, caller: statements.append(caller()) or "",
+        }
+        adapters = self.jinja_env.get_template("adapters.sql").make_module(context)
+        context["adapter"].dispatch = lambda name, *args: getattr(adapters, f"spark__{name}")
+        context["create_temporary_view"] = adapters.spark__create_temporary_view
+        context["create_view_as"] = adapters.spark__create_view_as
+        context["return"] = lambda relation: relations.append(relation) or ""
+        template = self.jinja_env.get_template("materializations/snapshot.sql").make_module(
+            context
+        )
+        template.spark_build_snapshot_staging_table({}, "select 1", target)
+
+        self.assertEqual(len(statements), 1)
+        return statements, relations
+
+    def test_permanent_view_keeps_catalog_and_schema(self):
+        self.default_context["config"].persist_column_docs.return_value = False
+        template = self.__get_template("adapters.sql")
+        self.default_context["adapter"].dispatch = lambda name, *args: getattr(
+            template.module, f"spark__{name}"
+        )
+        relation = SparkRelation.create(
+            database="polaris", schema="analytics", identifier="report", type="view"
+        )
+        sql = template.module.spark__create_view_as(relation, "select 1 as id")
+        self.assertEqual(
+            re.sub(r"\s+", " ", sql).strip(),
+            "create or replace view polaris.analytics.report as select 1 as id",
+        )
 
     def test_macros_create_table_as(self):
         template = self.__get_template("adapters.sql")

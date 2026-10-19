@@ -35,6 +35,40 @@ dbt is the T in ELT. Organize, cleanse, denormalize, filter, rename, and pre-agg
 `dbt-spark` enables dbt to work with Apache Spark.
 For more information on using dbt with Spark, consult [the docs](https://docs.getdbt.com/docs/profile-spark).
 
+### Iceberg catalog relation listing and views
+
+With a `session` connection, dbt detects catalogs implemented by
+`org.apache.iceberg.spark.SparkCatalog` using the configured Spark session.
+When both `iceberg_listing_fast` and `use_v2_relation_listing` behavior flags are
+enabled (the defaults), these catalogs use `SHOW TABLES` and `SHOW VIEWS` to discover
+persistent relations without running `DESCRIBE` for every table. Session-temporary
+views are excluded from this listing, even if they have the same name as a persistent table.
+
+To disable this optimization, configure the adapter behavior flag in `dbt_project.yml`:
+
+```yaml
+flags:
+  iceberg_listing_fast: false
+```
+
+Disabling `iceberg_listing_fast` retains the existing v2-first listing with per-table
+metadata lookup. Disabling `use_v2_relation_listing` selects the existing v1-first
+listing regardless of `iceberg_listing_fast`. The former `ICEBERG_LISTING_FAST`
+environment variable is no longer read.
+
+Other catalog classes and connection methods retain the existing relation-listing
+path. Catalog detection failures are logged at debug level; unexpected SQL listing
+errors are propagated rather than treated as an empty namespace.
+
+Permanent view models use fully qualified `CREATE OR REPLACE VIEW`. For Iceberg
+catalog views on Spark 4.1, the Spark runtime must be configured with
+`org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions` in
+`spark.sql.extensions` before the session starts, and the backing catalog must
+support views. Configuring `SparkCatalog` alone does not establish view support.
+Iceberg snapshot staging uses identifier-only, session-local temporary views;
+these are described, used by the snapshot merge, and dropped within that session,
+not created as permanent objects in the session's default catalog.
+
 # Getting started
 
 Review the repository [README.md](../README.md) as most of that information pertains to `dbt-spark`.

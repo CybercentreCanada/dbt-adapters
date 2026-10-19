@@ -17,7 +17,7 @@
 
     merge into {{ target }} as DBT_INTERNAL_DEST
     {% if target.is_iceberg %}
-      {# create view only supports a name (no catalog, or schema) #}
+      {# Iceberg staging uses a session-local temporary view. #}
       using {{ source.identifier }} as DBT_INTERNAL_SOURCE
     {% else %}
       using {{ source }} as DBT_INTERNAL_SOURCE
@@ -45,7 +45,6 @@
     {% set tmp_identifier = target_relation.identifier ~ '__dbt_tmp' %}
 
     {% if target_relation.is_iceberg %}
-      {# iceberg catalog does not support create view, but regular spark does. We removed the catalog and schema #}
       {%- set tmp_relation = api.Relation.create(identifier=tmp_identifier,
                                                     schema=none,
                                                     database=none,
@@ -59,9 +58,12 @@
 
     {% set select = snapshot_staging_table(strategy, sql, target_relation) %}
 
-    {# needs to be a non-temp view so that its columns can be ascertained via `describe` #}
     {% call statement('build_snapshot_staging_relation') %}
-        {{ create_view_as(tmp_relation, select) }}
+        {% if target_relation.is_iceberg %}
+            {{ create_temporary_view(tmp_relation, select) }}
+        {% else %}
+            {{ create_view_as(tmp_relation, select) }}
+        {% endif %}
     {% endcall %}
 
     {% do return(tmp_relation) %}
