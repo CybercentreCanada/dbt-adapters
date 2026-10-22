@@ -133,6 +133,51 @@ sudo dnf install -y unixODBC unixODBC-devel
 
 The following features have been added to dbt-spark beyond the upstream open-source version.
 
+### Fast Iceberg Relation Listing
+
+<!-- CCCS: session-only catalog detection and constant-query relation discovery. -->
+With a `session` connection, catalogs implemented by
+`org.apache.iceberg.spark.SparkCatalog` use `SHOW TABLES` and `SHOW VIEWS` to
+discover persistent tables and views. This takes two listing queries regardless
+of table count, with no per-table `DESCRIBE`. Temporary tables/views are excluded,
+including temporary views that share a persistent table's name.
+
+Both `iceberg_listing_fast` and `use_v2_relation_listing` default to `true`.
+To restore the existing v2-first listing with per-table metadata lookup, set
+the following in `dbt_project.yml`:
+
+```yaml
+flags:
+  iceberg_listing_fast: false
+```
+
+Setting `use_v2_relation_listing: false` instead retains the existing v1-first
+listing, regardless of `iceberg_listing_fast`. `ICEBERG_LISTING_FAST` is not an
+environment-variable switch.
+
+Catalog detection uses the same configured Spark session as query execution.
+Confirmed classifications (including non-Iceberg catalogs) are cached per adapter,
+Spark session, and catalog; concurrent namespace listings share the cached probe.
+Absent catalog configuration uses a JVM catalog-class lookup. Unknown results
+are debug-logged, are not cached, and retain regular listing. A replacement
+session is checked independently; catalog registrations are assumed stable
+within a session. Disable the flag if changing catalog implementations in place.
+
+Remote connections, custom catalog classes, and the mixed-provider
+`SparkSessionCatalog` retain regular listing. Fast-listed relations have empty
+`information` strings; columns are fetched separately when needed. Tables are
+marked Iceberg, while views are not. Missing namespaces return an empty list;
+other listing errors propagate, including lack of `SHOW VIEWS` support. Use the
+opt-out above if the runtime does not support view listing.
+
+The focused live test requires a configured Iceberg session with persistent-view
+support. In that environment, run:
+
+```sh
+DBT_RUN_ICEBERG_LISTING_TESTS=1 hatch run python -m pytest \
+  tests/functional/adapter/test_iceberg_listing.py --profile spark_session -n 0
+```
+
 ### Iceberg Tblproperties Sync
 
 Iceberg tables support post-creation syncing of `tblproperties`. When a model's `tblproperties` config changes between runs, dbt will detect the diff and issue the appropriate `ALTER TABLE SET TBLPROPERTIES` and `ALTER TABLE UNSET TBLPROPERTIES` statements.

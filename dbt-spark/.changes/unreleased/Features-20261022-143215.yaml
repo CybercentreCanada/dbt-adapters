@@ -1,0 +1,3 @@
+kind: Features
+body: 'CCCS: Add default-enabled, session-only fast Iceberg relation listing using SHOW TABLES and SHOW VIEWS without per-table DESCRIBE, with concurrency-safe per-session/catalog detection caching and an iceberg_listing_fast opt-out.'
+time: 2026-10-22T14:32:15.081250688-04:00

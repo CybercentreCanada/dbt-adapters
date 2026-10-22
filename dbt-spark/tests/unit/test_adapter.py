@@ -1,5 +1,6 @@
 import unittest
 import pytest
+from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import get_context
 from unittest import mock
 
@@ -7,7 +8,8 @@ from dbt_common.exceptions import DbtRuntimeError
 from agate import Row
 from pyhive import hive
 from dbt.adapters.spark import SparkAdapter, SparkColumn, SparkRelation
-from dbt.adapters.spark.connections import build_ssl_transport
+from dbt.adapters.spark.connections import build_ssl_transport, SparkConnectionMethod
+from dbt.adapters.contracts.relation import RelationType
 from dbt.adapters.spark.impl import (
     LIST_RELATIONS_MACRO_NAME,
     SCHEMA_NOT_FOUND_MESSAGES,
@@ -16,6 +18,301 @@ from dbt.adapters.spark.impl import (
 from .utils import config_from_parts_or_dicts
 
 ENFORCED_SPARK_CONFIG = {"spark.sql.ansi.enabled": "false"}
+
+
+# CCCS regression coverage for the two-query Iceberg listing and session-scoped detection.
+@pytest.fixture
+def listing_adapter(target_http):
+    return SparkAdapter(target_http, get_context("spawn"))
+
+
+@pytest.mark.parametrize(
+    "flags,eligible,expected",
+    [
+        ({}, True, "_list_relations_fast"),
+        ({}, False, "_list_relations_v2_first"),
+        ({"iceberg_listing_fast": False}, True, "_list_relations_v2_first"),
+        ({"use_v2_relation_listing": False}, True, "_list_relations_v1_first"),
+    ],
+)
+def test_iceberg_listing_dispatch(target_http, flags, eligible, expected):
+    with mock.patch.object(target_http, "flags", flags, create=True):
+        adapter = SparkAdapter(target_http, get_context("spawn"))
+    relation = adapter.Relation.create(database="polaris", schema="analytics")
+    with (
+        mock.patch.object(adapter, "_catalog_is_iceberg_only", return_value=eligible) as detect,
+        mock.patch.object(adapter, "_list_relations_fast", return_value=[]) as fast,
+        mock.patch.object(adapter, "_list_relations_v2_first", return_value=[]) as v2,
+        mock.patch.object(adapter, "_list_relations_v1_first", return_value=[]) as v1,
+    ):
+        assert adapter.list_relations_without_caching(relation) == []
+    for name, method in zip(
+        ("_list_relations_fast", "_list_relations_v2_first", "_list_relations_v1_first"),
+        (fast, v2, v1),
+    ):
+        assert method.call_count == int(name == expected)
+    assert detect.call_count == int(all(flags.values()))
+    assert bool(adapter.behavior.iceberg_listing_fast) == flags.get("iceberg_listing_fast", True)
+
+
+@pytest.mark.parametrize("table_count", [0, 1, 1000])
+def test_fast_listing_constant_query_count(listing_adapter, table_count):
+    relation = listing_adapter.Relation.create(database="polaris", schema="parent.child")
+    tables = [("parent.child", f"table_{index}", False) for index in range(table_count)]
+    with (
+        mock.patch.object(
+            listing_adapter, "execute", side_effect=[(None, tables), (None, [])]
+        ) as sql,
+        mock.patch.object(listing_adapter, "execute_macro") as macro,
+    ):
+        result = listing_adapter._list_relations_fast(relation)
+    assert len(result) == table_count
+    assert [r.identifier for r in result] == [row[1] for row in tables]
+    assert all(r.is_table and r.is_iceberg for r in result)
+    assert all(
+        r.database == "polaris"
+        and r.schema == "parent.child"
+        and r.information == ""
+        and not r.is_delta
+        and not r.is_hudi
+        for r in result
+    )
+    assert sql.call_args_list == [
+        mock.call(f"show tables in {relation} like '*'", fetch=True),
+        mock.call(f"show views in {relation} like '*'", fetch=True),
+    ]
+    macro.assert_not_called()
+
+
+def test_fast_listing_excludes_temporary_relations_and_deduplicates_views(listing_adapter):
+    relation = listing_adapter.Relation.create(database="polaris", schema="analytics")
+    tables = [("analytics", "orders", False), ("analytics", "report", False), ("", "temp", True)]
+    views = [
+        ("analytics", "report", False),
+        ("analytics", "other_view", False),
+        ("", "orders", True),
+        ("", "temp", True),
+    ]
+    with mock.patch.object(
+        listing_adapter, "execute", side_effect=[(None, tables), (None, views)]
+    ):
+        result = listing_adapter._list_relations_fast(relation)
+    assert [(r.identifier, r.type, r.is_iceberg) for r in result] == [
+        ("orders", RelationType.Table, True),
+        ("report", RelationType.View, False),
+        ("other_view", RelationType.View, False),
+    ]
+    assert all(r.database == "polaris" and r.schema == "analytics" for r in result)
+
+
+@pytest.mark.parametrize("statement", [0, 1])
+@pytest.mark.parametrize("message", [*SCHEMA_NOT_FOUND_MESSAGES, "Permission denied"])
+def test_fast_listing_errors(listing_adapter, statement, message):
+    effects = [(None, [])] * statement + [DbtRuntimeError(message)]
+    relation = listing_adapter.Relation.create(database="polaris", schema="analytics")
+    with mock.patch.object(listing_adapter, "execute", side_effect=effects):
+        if message in SCHEMA_NOT_FOUND_MESSAGES:
+            assert listing_adapter._list_relations_fast(relation) == []
+        else:
+            with pytest.raises(DbtRuntimeError, match="Permission denied"):
+                listing_adapter._list_relations_fast(relation)
+
+
+@pytest.fixture
+def session_listing_adapter(listing_adapter):
+    with mock.patch.object(
+        listing_adapter.config.credentials, "method", SparkConnectionMethod.SESSION
+    ):
+        yield listing_adapter
+
+
+@pytest.mark.parametrize(
+    "catalog_class,expected",
+    [
+        ("org.apache.iceberg.spark.SparkCatalog", True),
+        ("org.apache.iceberg.spark.SparkSessionCatalog", False),
+        ("custom.SparkCatalog", False),
+    ],
+)
+def test_catalog_detection_caches_positive_and_negative(
+    session_listing_adapter, catalog_class, expected
+):
+    spark = mock.Mock()
+    spark.conf.get.return_value = catalog_class
+    with mock.patch(
+        "dbt.adapters.spark.session.get_spark_session", return_value=spark
+    ) as get_session:
+        for _ in range(3):
+            assert session_listing_adapter._catalog_is_iceberg_only("polaris") == expected
+    spark.conf.get.assert_called_once_with("spark.sql.catalog.polaris", None)
+    spark._jsparkSession.sessionState.assert_not_called()
+    get_session.assert_called_with(
+        session_listing_adapter.config.credentials.server_side_parameters
+    )
+
+
+def test_catalog_detection_concurrent_cache_misses(session_listing_adapter):
+    import time
+
+    spark = mock.Mock()
+
+    def get_config(*args):
+        time.sleep(0.01)
+        return "org.apache.iceberg.spark.SparkCatalog"
+
+    spark.conf.get.side_effect = get_config
+    with mock.patch("dbt.adapters.spark.session.get_spark_session", return_value=spark):
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            assert all(
+                pool.map(session_listing_adapter._catalog_is_iceberg_only, ["polaris"] * 16)
+            )
+    spark.conf.get.assert_called_once_with("spark.sql.catalog.polaris", None)
+
+
+def test_catalog_detection_current_catalog_is_not_cached(session_listing_adapter):
+    spark = mock.Mock()
+    spark.catalog.currentCatalog.side_effect = ["polaris", "other"]
+    spark.conf.get.side_effect = [
+        "org.apache.iceberg.spark.SparkCatalog",
+        "org.apache.iceberg.spark.SparkSessionCatalog",
+    ]
+    with mock.patch("dbt.adapters.spark.session.get_spark_session", return_value=spark):
+        assert session_listing_adapter._catalog_is_iceberg_only(None)
+        assert not session_listing_adapter._catalog_is_iceberg_only(None)
+    assert spark.conf.get.call_args_list == [
+        mock.call("spark.sql.catalog.polaris", None),
+        mock.call("spark.sql.catalog.other", None),
+    ]
+
+
+def test_catalog_detection_jvm_fallback(session_listing_adapter):
+    spark = mock.Mock()
+    spark.conf.get.return_value = None
+    catalog = spark._jsparkSession.sessionState().catalogManager().catalog.return_value
+    catalog.getClass().getName.return_value = "org.apache.iceberg.spark.SparkCatalog"
+    with mock.patch("dbt.adapters.spark.session.get_spark_session", return_value=spark):
+        assert session_listing_adapter._catalog_is_iceberg_only("polaris")
+        assert session_listing_adapter._catalog_is_iceberg_only("polaris")
+    spark._jsparkSession.sessionState().catalogManager().catalog.assert_called_once_with("polaris")
+
+
+@pytest.mark.parametrize("failure", ["session", "config", "jvm", "unknown"])
+def test_catalog_detection_failure_is_logged_and_retried(session_listing_adapter, failure):
+    spark = mock.Mock()
+    spark.conf.get.return_value = "org.apache.iceberg.spark.SparkCatalog"
+    if failure == "config":
+        spark.conf.get.side_effect = RuntimeError("Configuration unavailable")
+    elif failure in ("jvm", "unknown"):
+        spark.conf.get.return_value = None
+        if failure == "jvm":
+            spark._jsparkSession.sessionState.side_effect = RuntimeError("JVM unavailable")
+        else:
+            spark._jsparkSession.sessionState().catalogManager().catalog().getClass().getName.return_value = (
+                None
+            )
+    with (
+        mock.patch(
+            "dbt.adapters.spark.session.get_spark_session", return_value=spark
+        ) as get_session,
+        mock.patch("dbt.adapters.spark.impl.logger.debug") as log,
+    ):
+        if failure == "session":
+            get_session.side_effect = RuntimeError("Session unavailable")
+        assert not session_listing_adapter._catalog_is_iceberg_only("polaris")
+        assert session_listing_adapter._catalog_class_cache == {}
+        log.assert_called_once()
+        get_session.side_effect = None
+        spark.conf.get.side_effect = None
+        spark.conf.get.return_value = "org.apache.iceberg.spark.SparkCatalog"
+        assert session_listing_adapter._catalog_is_iceberg_only("polaris")
+
+
+def test_catalog_detection_cache_isolation(session_listing_adapter):
+    iceberg = mock.Mock()
+    iceberg.conf.get.return_value = "org.apache.iceberg.spark.SparkCatalog"
+    mixed = mock.Mock()
+    mixed.conf.get.return_value = "org.apache.iceberg.spark.SparkSessionCatalog"
+    other_adapter = SparkAdapter(session_listing_adapter.config, get_context("spawn"))
+    with mock.patch(
+        "dbt.adapters.spark.session.get_spark_session",
+        side_effect=[iceberg, mixed, iceberg, iceberg],
+    ):
+        assert session_listing_adapter._catalog_is_iceberg_only("polaris")
+        assert not session_listing_adapter._catalog_is_iceberg_only("polaris")
+        assert session_listing_adapter._catalog_is_iceberg_only("polaris")
+        iceberg.conf.get.return_value = "org.apache.iceberg.spark.SparkSessionCatalog"
+        assert not other_adapter._catalog_is_iceberg_only("polaris")
+    assert iceberg.conf.get.call_count == 2
+    mixed.conf.get.assert_called_once()
+
+
+@pytest.mark.parametrize("method", ["http", "thrift", "odbc"])
+def test_catalog_detection_remote_does_not_acquire_session(listing_adapter, method):
+    real_import = __import__
+
+    def forbid_local_spark(name, *args, **kwargs):
+        assert not name.startswith(("pyspark", "py4j", "dbt.adapters.spark.session"))
+        return real_import(name, *args, **kwargs)
+
+    with (
+        mock.patch.object(listing_adapter.config.credentials, "method", method),
+        mock.patch("builtins.__import__", side_effect=forbid_local_spark),
+    ):
+        assert not listing_adapter._catalog_is_iceberg_only("polaris")
+
+
+def test_catalog_detection_does_not_swallow_programming_errors(session_listing_adapter):
+    with mock.patch("dbt.adapters.spark.session.get_spark_session", side_effect=TypeError("bug")):
+        with pytest.raises(TypeError, match="bug"):
+            session_listing_adapter._catalog_is_iceberg_only("polaris")
+
+
+def test_configured_session_helper_and_cursor():
+    from dbt.adapters.spark.session import Cursor, get_spark_session
+
+    parameters = {"spark.sql.catalog.polaris": "org.apache.iceberg.spark.SparkCatalog"}
+    with mock.patch("dbt.adapters.spark.session.SparkSession") as session:
+        builder = session.builder
+        builder.config.return_value = builder
+        assert get_spark_session(parameters) is builder.getOrCreate.return_value
+        builder.config.assert_called_once_with(
+            "spark.sql.catalog.polaris", "org.apache.iceberg.spark.SparkCatalog"
+        )
+    with mock.patch("dbt.adapters.spark.session.get_spark_session") as acquire:
+        cursor = Cursor(server_side_parameters=parameters)
+        cursor.execute("select 1")
+        acquire.assert_called_once_with(parameters)
+        acquire.return_value.sql.assert_called_once_with("select 1")
+
+
+@pytest.mark.parametrize("relation_type", [RelationType.Table, RelationType.View])
+def test_fast_listing_metadata_is_fetched_when_requested(listing_adapter, relation_type):
+    schema = listing_adapter.Relation.create(database="polaris", schema="analytics")
+    rows = [("analytics", "orders", False)]
+    with mock.patch.object(
+        listing_adapter,
+        "execute",
+        side_effect=[(None, rows), (None, rows if relation_type == RelationType.View else [])],
+    ):
+        relation = listing_adapter._list_relations_fast(schema)[0]
+    column = SparkColumn(column="id", dtype="int")
+    if relation.is_iceberg:
+        with (
+            mock.patch(
+                "dbt.adapters.sql.SQLAdapter.get_columns_in_relation", return_value=[]
+            ) as raw,
+            mock.patch.object(listing_adapter, "parse_describe_extended", return_value=[column]),
+        ):
+            metadata = list(listing_adapter._get_columns_for_catalog(relation))
+        raw.assert_called_once_with(relation)
+    else:
+        with mock.patch.object(
+            listing_adapter, "get_columns_in_relation", return_value=[column]
+        ) as describe:
+            metadata = list(listing_adapter._get_columns_for_catalog(relation))
+        describe.assert_called_once_with(relation)
+    assert metadata
+    assert all(row["column_name"] == "id" and row["column_type"] == "int" for row in metadata)
 
 
 class TestSparkAdapter(unittest.TestCase):

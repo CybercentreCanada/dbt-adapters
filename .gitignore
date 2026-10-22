@@ -3,6 +3,13 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Exclude vs code extension logs
+
+**/logs/
+dbt-databricks
+dbt-spark-1.10
+**/plan/
+
 # C extensions
 *.so
 
