@@ -1,6 +1,10 @@
 """Unit tests for the Spark Python streaming materialization template."""
 
 from pathlib import Path
+import sys
+from types import SimpleNamespace
+from unittest import mock
+import warnings
 
 import pytest
 from jinja2 import Environment
@@ -75,6 +79,7 @@ def _render_stream_table(
     partition_by: list[str] | None = None,
     tblproperties: dict[str, str] | None = None,
     read_stream_options: dict[str, str] | None = None,
+    target_exists: bool = False,
 ) -> str:
     render_config = {
         "location_root": location_root,
@@ -135,7 +140,7 @@ def _render_stream_table(
         if macro_name == "py_stream_table"
         else "select 1"
     )
-    return macro(compiled_code, "analytics.stream", False)
+    return macro(compiled_code, "analytics.stream", target_exists)
 
 
 def test_streaming_materialization_template_parses():
@@ -208,6 +213,69 @@ def test_streaming_materialization_quotes_partition_transform_columns(macro_name
 
     assert 'writer = writer.partitionedBy(days("ingest_loaded_by"))' in rendered
     assert "days(ingest_loaded_by)" not in rendered
+
+
+@pytest.mark.parametrize("macro_name", ["py_stream_table", "sql_stream_table"])
+@pytest.mark.parametrize("modern", [False, True])
+@pytest.mark.parametrize("target_exists, active", [(False, False), (True, False), (True, True)])
+def test_streaming_partition_function_compatibility(macro_name, modern, target_exists, active):
+    names = ("years", "months", "days", "hours", "bucket")
+    functions = SimpleNamespace(**{name: mock.Mock(return_value=name) for name in names})
+    if modern:
+        functions.partitioning = SimpleNamespace(
+            **{name: mock.Mock(return_value=name) for name in names}
+        )
+        for name in names:
+            getattr(functions, name).side_effect = AssertionError(
+                f"Deprecated {name} helper called"
+            )
+    selected = functions.partitioning if modern else functions
+    dataframe_type = type("DataFrame", (), {})
+    df = dataframe_type()
+    df.schema = mock.sentinel.schema
+    df.isStreaming = True
+    df.writeStream = mock.MagicMock()
+    query = mock.Mock(name="query")
+    query.name = "analytics.stream"
+    spark = mock.MagicMock()
+    spark.streams.active = [query] if active else []
+    spark.readStream.table.return_value = df
+    spark.sql.return_value = df
+    pyspark = SimpleNamespace(
+        sql=SimpleNamespace(
+            dataframe=SimpleNamespace(DataFrame=dataframe_type), functions=functions
+        )
+    )
+    rendered = _render_stream_table(
+        macro_name, partition_by=["days(ingest_loaded_by)"], target_exists=target_exists
+    )
+    namespace = {"spark": spark, "dbtObj": mock.Mock()}
+    with mock.patch.dict(
+        sys.modules,
+        {
+            "pyspark": pyspark,
+            "pyspark.sql": pyspark.sql,
+            "pyspark.sql.functions": functions,
+        },
+    ):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", FutureWarning)
+            exec(compile(rendered, f"{macro_name}.py", "exec"), namespace)
+    if not target_exists and not active:
+        selected.days.assert_called_once_with("ingest_loaded_by")
+        for name in names:
+            assert namespace[name] is getattr(selected, name)
+        spark.createDataFrame.assert_called_once_with([], df.schema)
+    else:
+        spark.createDataFrame.assert_not_called()
+        for name in names:
+            getattr(selected, name).assert_not_called()
+    if modern:
+        for name in names:
+            getattr(functions, name).assert_not_called()
+    if active:
+        spark.readStream.table.assert_not_called()
+        spark.sql.assert_not_called()
 
 
 @pytest.mark.parametrize("macro_name", ["py_stream_table", "sql_stream_table"])

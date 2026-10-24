@@ -128,7 +128,13 @@ if not {{ dataframe }}.isStreaming:
     raise TypeError("dbt streaming models must produce a streaming PySpark DataFrame")
 
 if not {{ target_exists }}:
-    from pyspark.sql.functions import years, months, days, hours, bucket
+    from pyspark.sql import functions as _dbt_functions
+    _dbt_partitioning = getattr(_dbt_functions, "partitioning", _dbt_functions)
+    years = _dbt_partitioning.years
+    months = _dbt_partitioning.months
+    days = _dbt_partitioning.days
+    hours = _dbt_partitioning.hours
+    bucket = _dbt_partitioning.bucket
 
     writer = spark.createDataFrame([], {{ dataframe }}.schema).writeTo(target_name).using("{{ config.get('file_format') or 'iceberg' }}")
 {{ python__partitionedBy_clause() | indent(2, true) }}

@@ -1,7 +1,10 @@
 import unittest
 from unittest import mock
 import re
+import sys
+import warnings
 from pathlib import Path
+from types import SimpleNamespace
 from jinja2 import Environment, FileSystemLoader
 
 
@@ -235,7 +238,7 @@ class TestSparkMacros(unittest.TestCase):
         self.assertIn('target_location = "/mnt/root/my_table"', python)
         self.assertIn('writer = writer.option("location", target_location)', python)
 
-    def test_python_partitioned_by_clause_quotes_transform_columns(self):
+    def __get_python_table_template(self):
         source = (
             Path("src/dbt/include/spark/macros/materializations/table.sql")
             .read_text()
@@ -245,8 +248,10 @@ class TestSparkMacros(unittest.TestCase):
             )
             .replace("{% endmaterialization %}", "{% endmacro %}")
         )
-        template = self.jinja_env.from_string(source, globals=self.default_context)
+        return self.jinja_env.from_string(source, globals=self.default_context)
 
+    def test_python_partitioned_by_clause_quotes_transform_columns(self):
+        template = self.__get_python_table_template()
         self.config["partition_by"] = [
             "region",
             "days(ingest_loaded_by)",
@@ -259,6 +264,115 @@ class TestSparkMacros(unittest.TestCase):
             'writer = writer.partitionedBy("region",days("ingest_loaded_by"),months("created_at"),bucket(16, "user_id"))',
             python,
         )
+
+    def test_python_table_partition_functions(self):
+        self.default_context["python__location_clause"] = lambda: ""
+        transforms = {
+            "years": ("created_at",),
+            "months": ("created_at",),
+            "days": ("created_at",),
+            "hours": ("ingest_loaded_by",),
+            "bucket": (16, "user_id"),
+        }
+        partitions = [
+            "region",
+            "years(created_at)",
+            "months(`created_at`)",
+            "days(created_at)",
+            "hours(ingest_loaded_by)",
+            "bucket(16, user_id)",
+        ]
+        for modern in (True, False):
+            for temporary in (True, False):
+                for partition_by in (partitions, "hours(ingest_loaded_by)", None):
+                    with self.subTest(
+                        modern=modern, temporary=temporary, partition_by=partition_by
+                    ):
+                        functions = SimpleNamespace(
+                            **{
+                                name: mock.Mock(return_value=f"{name}_expression")
+                                for name in transforms
+                            }
+                        )
+                        if modern:
+                            functions.partitioning = SimpleNamespace(
+                                **{
+                                    name: mock.Mock(return_value=f"{name}_expression")
+                                    for name in transforms
+                                }
+                            )
+                            for name in transforms:
+                                getattr(functions, name).side_effect = AssertionError(
+                                    f"Deprecated {name} helper called"
+                                )
+                        selected = functions.partitioning if modern else functions
+                        dataframe_type = type("DataFrame", (), {})
+                        df = dataframe_type()
+                        df.createOrReplaceTempView = mock.Mock()
+                        writer = mock.Mock()
+                        writer.using.return_value = writer
+                        writer.option.return_value = writer
+                        writer.partitionedBy.return_value = writer
+                        df.writeTo = mock.Mock(return_value=writer)
+                        spark = mock.Mock()
+                        pyspark = SimpleNamespace(
+                            sql=SimpleNamespace(
+                                dataframe=SimpleNamespace(DataFrame=dataframe_type),
+                                functions=functions,
+                            )
+                        )
+                        self.config["partition_by"] = partition_by
+                        rendered = self.__get_python_table_template().module.py_write_table(
+                            "", "catalog.schema.target", temporary
+                        )
+                        modules = {
+                            "pyspark": pyspark,
+                            "pyspark.sql": pyspark.sql,
+                            "pyspark.sql.functions": functions,
+                            "pyspark.pandas": None,
+                            "pandas": None,
+                            "databricks.koalas": None,
+                        }
+                        with mock.patch.dict(sys.modules, modules):
+                            with warnings.catch_warnings():
+                                warnings.simplefilter("error", FutureWarning)
+                                exec(
+                                    compile(rendered, "python_table.py", "exec"),
+                                    {
+                                        "spark": spark,
+                                        "dbtObj": mock.Mock(),
+                                        "model": mock.Mock(return_value=df),
+                                    },
+                                )
+                        if temporary:
+                            df.createOrReplaceTempView.assert_called_once_with(
+                                "catalog.schema.target"
+                            )
+                            df.writeTo.assert_not_called()
+                        else:
+                            df.writeTo.assert_called_once_with("catalog.schema.target")
+                            writer.create.assert_called_once_with()
+                            df.createOrReplaceTempView.assert_not_called()
+                        expected = (
+                            list(transforms)
+                            if partition_by == partitions
+                            else ["hours"] if partition_by else []
+                        )
+                        for name, args in transforms.items():
+                            helper = getattr(selected, name)
+                            if not temporary and name in expected:
+                                helper.assert_called_once_with(*args)
+                            else:
+                                helper.assert_not_called()
+                            if modern:
+                                getattr(functions, name).assert_not_called()
+                        if not temporary and expected:
+                            expressions = [f"{name}_expression" for name in expected]
+                            if partition_by == partitions:
+                                expressions.insert(0, "region")
+                            writer.partitionedBy.assert_called_once_with(*expressions)
+                        else:
+                            writer.partitionedBy.assert_not_called()
 
     def test_macros_create_table_as_comment(self):
         template = self.__get_template("adapters.sql")

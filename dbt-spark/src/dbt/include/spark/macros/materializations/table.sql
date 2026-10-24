@@ -129,8 +129,13 @@ else:
 if {{ temporary }}:
   df.createOrReplaceTempView("{{ target_relation }}")
 else:
-  {# Import functions that can be used for partitioning See https://spark.apache.org/docs/3.5.5/api/python/reference/pyspark.sql/api/pyspark.sql.DataFrameWriterV2.partitionedBy.html #}
-  from pyspark.sql.functions import years, months, days, hours, bucket
+  from pyspark.sql import functions as _dbt_functions
+  _dbt_partitioning = getattr(_dbt_functions, "partitioning", _dbt_functions)
+  years = _dbt_partitioning.years
+  months = _dbt_partitioning.months
+  days = _dbt_partitioning.days
+  hours = _dbt_partitioning.hours
+  bucket = _dbt_partitioning.bucket
   writer = df.writeTo("{{ target_relation }}") \
     .using("{{ config.get('file_format') or 'iceberg' }}") \
     .option("overwriteSchema", "true")

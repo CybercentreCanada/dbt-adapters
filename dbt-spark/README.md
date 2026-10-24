@@ -206,6 +206,21 @@ Column comments are now only updated when they differ from the existing database
 - Only columns with differing comments trigger an `ALTER` statement.
 - Requires `persist_docs.columns: true` in model config.
 
+### Python Partition Transform Compatibility
+
+Python table and incremental models keep the same `partition_by` syntax, for example
+`partition_by=["hours(ingest_loaded_by)", "region"]`. When creating a physical table,
+the generated Python uses `pyspark.sql.functions.partitioning` when available
+(Spark 4.0+) and otherwise uses the legacy functions namespace. This avoids Spark 4
+deprecation warnings for `years`, `months`, `days`, `hours`, and `bucket` without
+changing the table's partition transforms. Do not prefix transforms in model config
+with `partitioning.`.
+
+This compatibility handling applies to batch Python table creation, including
+physical incremental staging tables, and to sink creation for both Python and SQL
+streaming models. Temporary-view staging does not apply partition transforms.
+SQL partition syntax and microbatch processing windows are unchanged.
+
 ### Partition Drift Detection
 
 Two behavior flags enable detection of partition spec drift between model config and the existing Iceberg table:
@@ -452,17 +467,18 @@ flags:
   await_termination: true
 ```
 
-**Local streaming materialization tests**
+**Local streaming and batch materialization tests**
 
-The opt-in local streaming test starts a local Spark 3.5.6 session and writes a
-`rate` stream to a temporary Iceberg catalog. It requires Java 11 or 17 and
-Maven/Ivy network access on its first run to fetch the Iceberg runtime package.
+The opt-in local tests start Spark 3.5.6 sessions, write a `rate` stream to a
+temporary Iceberg catalog, and verify batch partition transforms against stored
+Iceberg metadata. They require Java 11 or 17 and Maven/Ivy network access on their
+first run to fetch the Iceberg runtime package.
 
 ```bash
 hatch run local-spark-tests:test
 ```
 
-This test is intentionally separate from the standard unit-test command.
+These tests are intentionally separate from the standard unit-test command.
 
 **Iceberg streaming writer options**
 

@@ -1,10 +1,11 @@
-"""Opt-in local Spark tests for the streaming materialization."""
+"""Opt-in local Spark tests for streaming and batch materializations."""
 
 import os
 import re
 import subprocess
 import time
 import uuid
+import warnings
 from pathlib import Path
 
 import pytest
@@ -27,7 +28,7 @@ class _Config:
     def __init__(self, values):
         self.values = values
 
-    def get(self, key, default=None):
+    def get(self, key, default=None, **kwargs):
         return self.values.get(key, default)
 
 
@@ -232,11 +233,82 @@ def test_streaming_materialization_creates_partitioned_local_iceberg_stream(spar
 
     assert 'writer = writer.partitionedBy(days("timestamp"))' in rendered
 
-    exec(compile(rendered, "streaming_partitioned_model.py", "exec"), namespace)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        exec(compile(rendered, "streaming_partitioned_model.py", "exec"), namespace)
     active_query = next(query for query in spark.streams.active if query.name == target_name)
     try:
+        assert not [
+            warning
+            for warning in caught
+            if "Deprecated in 4.0.0, use partitioning." in str(warning.message)
+        ]
         _wait_for_rows(spark, target_name)
         assert _table_partition_spec(spark, target_name) == ["days(timestamp)"]
     finally:
         active_query.stop()
         active_query.awaitTermination(10)
+
+
+@pytest.mark.parametrize(
+    "partitions, expected_spec",
+    [
+        (["region"], [("region", "identity")]),
+        (["years(timestamp)"], [("timestamp", "year")]),
+        (["months(timestamp)"], [("timestamp", "month")]),
+        (["days(timestamp)"], [("timestamp", "day")]),
+        (["hours(timestamp)"], [("timestamp", "hour")]),
+        (["bucket(4, id)"], [("id", "bucket[4]")]),
+        (
+            ["region", "hours(timestamp)", "bucket(4, id)"],
+            [("region", "identity"), ("timestamp", "hour"), ("id", "bucket[4]")],
+        ),
+    ],
+)
+def test_python_batch_materialization_creates_partitioned_table(spark, partitions, expected_spec):
+    source = (
+        STREAMING_TEMPLATE.with_name("table.sql")
+        .read_text()
+        .replace(
+            "{% materialization table, adapter = 'spark', supported_languages=['sql', 'python'] %}",
+            "{% macro table() %}",
+        )
+        .replace("{% endmaterialization %}", "{% endmacro %}")
+    )
+    template = Environment(extensions=["jinja2.ext.do"]).from_string(source)
+    template.globals.update(
+        {
+            "config": _Config({"partition_by": partitions}),
+            "validation": type("Validation", (), {"any": {(list, str): None}})(),
+            "basestring": str,
+            "python__location_clause": lambda: "",
+            "spark__filtered_tblproperties": lambda props: props,
+        }
+    )
+    target_name = f"test_catalog.default.batch_partitioned_{uuid.uuid4().hex}"
+    rendered = template.module.py_write_table("", target_name, False)
+    df = spark.sql(
+        "select 'west' as region, 1 as id, timestamp '2026-10-23 12:00:00' as timestamp"
+    )
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            exec(
+                compile(rendered, "batch_partitioned_model.py", "exec"),
+                {"dbtObj": _Dbt, "spark": spark, "model": lambda dbt, spark: df},
+            )
+        assert not [
+            warning
+            for warning in caught
+            if "Deprecated in 4.0.0, use partitioning." in str(warning.message)
+        ]
+        assert spark.table(target_name).count() == 1
+        table = spark._jvm.org.apache.iceberg.spark.Spark3Util.loadIcebergTable(
+            spark._jsparkSession, target_name
+        )
+        assert [
+            (table.schema().findColumnName(field.sourceId()), str(field.transform()))
+            for field in table.spec().fields()
+        ] == expected_spec
+    finally:
+        spark.sql(f"DROP TABLE IF EXISTS {target_name}")
