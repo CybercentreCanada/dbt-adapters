@@ -1,0 +1,4 @@
+kind: Features
+body: |
+  Rename `use_v1_relation_listing` behavior flag to `use_v2_relation_listing` (default true). The positive naming better reflects the default behavior — v2 relation listing (SHOW TABLES + DESCRIBE EXTENDED) is used first, falling back to v1 (SHOW TABLE EXTENDED) on failure. Set `use_v2_relation_listing: false` in dbt_project.yml flags to revert to legacy v1-first listing for catalogs that do not support v2 tables.
+time: 2026-05-29T00:00:04.000000-08:00

@@ -1,0 +1,4 @@
+kind: Fixes
+body: |
+  Default configurable materializations to Iceberg when `file_format` is omitted. Validate partition transforms before execution for every dbt-spark materialization that consumes `partition_by`, rejecting unsupported transforms such as `hour(event_time)`. Iceberg SQL writers accept `truncate(L, col)` for STRING, BINARY, INT, BIGINT, and DECIMAL columns; Python and streaming writers report a compiler error for `truncate`, which Spark's DataFrameWriterV2 does not support.
+time: 2026-10-06T00:00:00.000000-08:00

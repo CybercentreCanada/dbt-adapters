@@ -12,7 +12,6 @@ from dbt.adapters.spark import __version__
 
 # CCCS
 import traceback
-import dbt
 from pyspark.sql import SparkSession
 
 DEFAULT_POLLING_INTERVAL = 10
@@ -298,6 +297,7 @@ class AllPurposeClusterPythonJobHelper(BaseDatabricksHelper):
                     )
             finally:
                 context.destroy(context_id)
+
 
 # CCCS
 class SparkSessionBasedClusterPythonJobHelper(PythonJobHelper):

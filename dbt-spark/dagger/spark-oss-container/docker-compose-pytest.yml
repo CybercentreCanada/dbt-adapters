@@ -1,0 +1,16 @@
+services:
+
+  lookingglass-tables:
+    image: uchimera.azurecr.io/cccs/ap/lookingglass/lookingglass-tables:1.3.0
+    container_name: lookingglass-tables
+    pull_policy: always
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    environment:
+      - CATALOG_WAREHOUSE=file:///data/warehouse/internal/lookingglass
+      - LOOKINGGLASS_INTERNAL_WAREHOUSE_PATH=/data/warehouse/internal
+      - LOOKINGGLASS_EXTERNAL_WAREHOUSE_PATH=/data/warehouse/external
+    volumes:
+      - ${LG_EXTERNAL_WAREHOUSE:-/data/warehouse/external}:/data/warehouse/external
+    ports:
+      - "8080:8080"
+      - "8181:8181"
