@@ -1,15 +1,318 @@
 import unittest
 import pytest
+from concurrent.futures import ThreadPoolExecutor
 from multiprocessing import get_context
 from unittest import mock
 
-from dbt.exceptions import DbtRuntimeError
+from dbt_common.exceptions import DbtRuntimeError
 from agate import Row
 from pyhive import hive
-from dbt.adapters.spark import SparkAdapter, SparkRelation
+from dbt.adapters.spark import SparkAdapter, SparkColumn, SparkRelation
+from dbt.adapters.spark.connections import build_ssl_transport, SparkConnectionMethod
+from dbt.adapters.contracts.relation import RelationType
+from dbt.adapters.spark.impl import (
+    LIST_RELATIONS_MACRO_NAME,
+    SCHEMA_NOT_FOUND_MESSAGES,
+    TABLE_OR_VIEW_NOT_FOUND_MESSAGES,
+)
 from .utils import config_from_parts_or_dicts
 
 ENFORCED_SPARK_CONFIG = {"spark.sql.ansi.enabled": "false"}
+
+
+# CCCS regression coverage for the two-query Iceberg listing and session-scoped detection.
+@pytest.fixture
+def listing_adapter(target_http):
+    return SparkAdapter(target_http, get_context("spawn"))
+
+
+@pytest.mark.parametrize(
+    "flags,eligible,expected",
+    [
+        ({}, True, "_list_relations_fast"),
+        ({}, False, "_list_relations_v2_first"),
+        ({"iceberg_listing_fast": False}, True, "_list_relations_v2_first"),
+        ({"use_v2_relation_listing": False}, True, "_list_relations_v1_first"),
+    ],
+)
+def test_iceberg_listing_dispatch(target_http, flags, eligible, expected):
+    with mock.patch.object(target_http, "flags", flags, create=True):
+        adapter = SparkAdapter(target_http, get_context("spawn"))
+    relation = adapter.Relation.create(database="polaris", schema="analytics")
+    with (
+        mock.patch.object(adapter, "_catalog_is_iceberg_only", return_value=eligible) as detect,
+        mock.patch.object(adapter, "_list_relations_fast", return_value=[]) as fast,
+        mock.patch.object(adapter, "_list_relations_v2_first", return_value=[]) as v2,
+        mock.patch.object(adapter, "_list_relations_v1_first", return_value=[]) as v1,
+    ):
+        assert adapter.list_relations_without_caching(relation) == []
+    for name, method in zip(
+        ("_list_relations_fast", "_list_relations_v2_first", "_list_relations_v1_first"),
+        (fast, v2, v1),
+    ):
+        assert method.call_count == int(name == expected)
+    assert detect.call_count == int(all(flags.values()))
+    assert bool(adapter.behavior.iceberg_listing_fast) == flags.get("iceberg_listing_fast", True)
+
+
+@pytest.mark.parametrize("table_count", [0, 1, 1000])
+def test_fast_listing_constant_query_count(listing_adapter, table_count):
+    relation = listing_adapter.Relation.create(database="polaris", schema="parent.child")
+    tables = [("parent.child", f"table_{index}", False) for index in range(table_count)]
+    with (
+        mock.patch.object(
+            listing_adapter, "execute", side_effect=[(None, tables), (None, [])]
+        ) as sql,
+        mock.patch.object(listing_adapter, "execute_macro") as macro,
+    ):
+        result = listing_adapter._list_relations_fast(relation)
+    assert len(result) == table_count
+    assert [r.identifier for r in result] == [row[1] for row in tables]
+    assert all(r.is_table and r.is_iceberg for r in result)
+    assert all(
+        r.database == "polaris"
+        and r.schema == "parent.child"
+        and r.information == ""
+        and not r.is_delta
+        and not r.is_hudi
+        for r in result
+    )
+    assert sql.call_args_list == [
+        mock.call(f"show tables in {relation} like '*'", fetch=True),
+        mock.call(f"show views in {relation} like '*'", fetch=True),
+    ]
+    macro.assert_not_called()
+
+
+def test_fast_listing_excludes_temporary_relations_and_deduplicates_views(listing_adapter):
+    relation = listing_adapter.Relation.create(database="polaris", schema="analytics")
+    tables = [("analytics", "orders", False), ("analytics", "report", False), ("", "temp", True)]
+    views = [
+        ("analytics", "report", False),
+        ("analytics", "other_view", False),
+        ("", "orders", True),
+        ("", "temp", True),
+    ]
+    with mock.patch.object(
+        listing_adapter, "execute", side_effect=[(None, tables), (None, views)]
+    ):
+        result = listing_adapter._list_relations_fast(relation)
+    assert [(r.identifier, r.type, r.is_iceberg) for r in result] == [
+        ("orders", RelationType.Table, True),
+        ("report", RelationType.View, False),
+        ("other_view", RelationType.View, False),
+    ]
+    assert all(r.database == "polaris" and r.schema == "analytics" for r in result)
+
+
+@pytest.mark.parametrize("statement", [0, 1])
+@pytest.mark.parametrize("message", [*SCHEMA_NOT_FOUND_MESSAGES, "Permission denied"])
+def test_fast_listing_errors(listing_adapter, statement, message):
+    effects = [(None, [])] * statement + [DbtRuntimeError(message)]
+    relation = listing_adapter.Relation.create(database="polaris", schema="analytics")
+    with mock.patch.object(listing_adapter, "execute", side_effect=effects):
+        if message in SCHEMA_NOT_FOUND_MESSAGES:
+            assert listing_adapter._list_relations_fast(relation) == []
+        else:
+            with pytest.raises(DbtRuntimeError, match="Permission denied"):
+                listing_adapter._list_relations_fast(relation)
+
+
+@pytest.fixture
+def session_listing_adapter(listing_adapter):
+    with mock.patch.object(
+        listing_adapter.config.credentials, "method", SparkConnectionMethod.SESSION
+    ):
+        yield listing_adapter
+
+
+@pytest.mark.parametrize(
+    "catalog_class,expected",
+    [
+        ("org.apache.iceberg.spark.SparkCatalog", True),
+        ("org.apache.iceberg.spark.SparkSessionCatalog", False),
+        ("custom.SparkCatalog", False),
+    ],
+)
+def test_catalog_detection_caches_positive_and_negative(
+    session_listing_adapter, catalog_class, expected
+):
+    spark = mock.Mock()
+    spark.conf.get.return_value = catalog_class
+    with mock.patch(
+        "dbt.adapters.spark.session.get_spark_session", return_value=spark
+    ) as get_session:
+        for _ in range(3):
+            assert session_listing_adapter._catalog_is_iceberg_only("polaris") == expected
+    spark.conf.get.assert_called_once_with("spark.sql.catalog.polaris", None)
+    spark._jsparkSession.sessionState.assert_not_called()
+    get_session.assert_called_with(
+        session_listing_adapter.config.credentials.server_side_parameters
+    )
+
+
+def test_catalog_detection_concurrent_cache_misses(session_listing_adapter):
+    import time
+
+    spark = mock.Mock()
+
+    def get_config(*args):
+        time.sleep(0.01)
+        return "org.apache.iceberg.spark.SparkCatalog"
+
+    spark.conf.get.side_effect = get_config
+    with mock.patch("dbt.adapters.spark.session.get_spark_session", return_value=spark):
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            assert all(
+                pool.map(session_listing_adapter._catalog_is_iceberg_only, ["polaris"] * 16)
+            )
+    spark.conf.get.assert_called_once_with("spark.sql.catalog.polaris", None)
+
+
+def test_catalog_detection_current_catalog_is_not_cached(session_listing_adapter):
+    spark = mock.Mock()
+    spark.catalog.currentCatalog.side_effect = ["polaris", "other"]
+    spark.conf.get.side_effect = [
+        "org.apache.iceberg.spark.SparkCatalog",
+        "org.apache.iceberg.spark.SparkSessionCatalog",
+    ]
+    with mock.patch("dbt.adapters.spark.session.get_spark_session", return_value=spark):
+        assert session_listing_adapter._catalog_is_iceberg_only(None)
+        assert not session_listing_adapter._catalog_is_iceberg_only(None)
+    assert spark.conf.get.call_args_list == [
+        mock.call("spark.sql.catalog.polaris", None),
+        mock.call("spark.sql.catalog.other", None),
+    ]
+
+
+def test_catalog_detection_jvm_fallback(session_listing_adapter):
+    spark = mock.Mock()
+    spark.conf.get.return_value = None
+    catalog = spark._jsparkSession.sessionState().catalogManager().catalog.return_value
+    catalog.getClass().getName.return_value = "org.apache.iceberg.spark.SparkCatalog"
+    with mock.patch("dbt.adapters.spark.session.get_spark_session", return_value=spark):
+        assert session_listing_adapter._catalog_is_iceberg_only("polaris")
+        assert session_listing_adapter._catalog_is_iceberg_only("polaris")
+    spark._jsparkSession.sessionState().catalogManager().catalog.assert_called_once_with("polaris")
+
+
+@pytest.mark.parametrize("failure", ["session", "config", "jvm", "unknown"])
+def test_catalog_detection_failure_is_logged_and_retried(session_listing_adapter, failure):
+    spark = mock.Mock()
+    spark.conf.get.return_value = "org.apache.iceberg.spark.SparkCatalog"
+    if failure == "config":
+        spark.conf.get.side_effect = RuntimeError("Configuration unavailable")
+    elif failure in ("jvm", "unknown"):
+        spark.conf.get.return_value = None
+        if failure == "jvm":
+            spark._jsparkSession.sessionState.side_effect = RuntimeError("JVM unavailable")
+        else:
+            spark._jsparkSession.sessionState().catalogManager().catalog().getClass().getName.return_value = (
+                None
+            )
+    with (
+        mock.patch(
+            "dbt.adapters.spark.session.get_spark_session", return_value=spark
+        ) as get_session,
+        mock.patch("dbt.adapters.spark.impl.logger.debug") as log,
+    ):
+        if failure == "session":
+            get_session.side_effect = RuntimeError("Session unavailable")
+        assert not session_listing_adapter._catalog_is_iceberg_only("polaris")
+        assert session_listing_adapter._catalog_class_cache == {}
+        log.assert_called_once()
+        get_session.side_effect = None
+        spark.conf.get.side_effect = None
+        spark.conf.get.return_value = "org.apache.iceberg.spark.SparkCatalog"
+        assert session_listing_adapter._catalog_is_iceberg_only("polaris")
+
+
+def test_catalog_detection_cache_isolation(session_listing_adapter):
+    iceberg = mock.Mock()
+    iceberg.conf.get.return_value = "org.apache.iceberg.spark.SparkCatalog"
+    mixed = mock.Mock()
+    mixed.conf.get.return_value = "org.apache.iceberg.spark.SparkSessionCatalog"
+    other_adapter = SparkAdapter(session_listing_adapter.config, get_context("spawn"))
+    with mock.patch(
+        "dbt.adapters.spark.session.get_spark_session",
+        side_effect=[iceberg, mixed, iceberg, iceberg],
+    ):
+        assert session_listing_adapter._catalog_is_iceberg_only("polaris")
+        assert not session_listing_adapter._catalog_is_iceberg_only("polaris")
+        assert session_listing_adapter._catalog_is_iceberg_only("polaris")
+        iceberg.conf.get.return_value = "org.apache.iceberg.spark.SparkSessionCatalog"
+        assert not other_adapter._catalog_is_iceberg_only("polaris")
+    assert iceberg.conf.get.call_count == 2
+    mixed.conf.get.assert_called_once()
+
+
+@pytest.mark.parametrize("method", ["http", "thrift", "odbc"])
+def test_catalog_detection_remote_does_not_acquire_session(listing_adapter, method):
+    real_import = __import__
+
+    def forbid_local_spark(name, *args, **kwargs):
+        assert not name.startswith(("pyspark", "py4j", "dbt.adapters.spark.session"))
+        return real_import(name, *args, **kwargs)
+
+    with (
+        mock.patch.object(listing_adapter.config.credentials, "method", method),
+        mock.patch("builtins.__import__", side_effect=forbid_local_spark),
+    ):
+        assert not listing_adapter._catalog_is_iceberg_only("polaris")
+
+
+def test_catalog_detection_does_not_swallow_programming_errors(session_listing_adapter):
+    with mock.patch("dbt.adapters.spark.session.get_spark_session", side_effect=TypeError("bug")):
+        with pytest.raises(TypeError, match="bug"):
+            session_listing_adapter._catalog_is_iceberg_only("polaris")
+
+
+def test_configured_session_helper_and_cursor():
+    from dbt.adapters.spark.session import Cursor, get_spark_session
+
+    parameters = {"spark.sql.catalog.polaris": "org.apache.iceberg.spark.SparkCatalog"}
+    with mock.patch("dbt.adapters.spark.session.SparkSession") as session:
+        builder = session.builder
+        builder.config.return_value = builder
+        assert get_spark_session(parameters) is builder.getOrCreate.return_value
+        builder.config.assert_called_once_with(
+            "spark.sql.catalog.polaris", "org.apache.iceberg.spark.SparkCatalog"
+        )
+    with mock.patch("dbt.adapters.spark.session.get_spark_session") as acquire:
+        cursor = Cursor(server_side_parameters=parameters)
+        cursor.execute("select 1")
+        acquire.assert_called_once_with(parameters)
+        acquire.return_value.sql.assert_called_once_with("select 1")
+
+
+@pytest.mark.parametrize("relation_type", [RelationType.Table, RelationType.View])
+def test_fast_listing_metadata_is_fetched_when_requested(listing_adapter, relation_type):
+    schema = listing_adapter.Relation.create(database="polaris", schema="analytics")
+    rows = [("analytics", "orders", False)]
+    with mock.patch.object(
+        listing_adapter,
+        "execute",
+        side_effect=[(None, rows), (None, rows if relation_type == RelationType.View else [])],
+    ):
+        relation = listing_adapter._list_relations_fast(schema)[0]
+    column = SparkColumn(column="id", dtype="int")
+    if relation.is_iceberg:
+        with (
+            mock.patch(
+                "dbt.adapters.sql.SQLAdapter.get_columns_in_relation", return_value=[]
+            ) as raw,
+            mock.patch.object(listing_adapter, "parse_describe_extended", return_value=[column]),
+        ):
+            metadata = list(listing_adapter._get_columns_for_catalog(relation))
+        raw.assert_called_once_with(relation)
+    else:
+        with mock.patch.object(
+            listing_adapter, "get_columns_in_relation", return_value=[column]
+        ) as describe:
+            metadata = list(listing_adapter._get_columns_for_catalog(relation))
+        describe.assert_called_once_with(relation)
+    assert metadata
+    assert all(row["column_name"] == "id" and row["column_type"] == "int" for row in metadata)
 
 
 class TestSparkAdapter(unittest.TestCase):
@@ -23,10 +326,12 @@ class TestSparkAdapter(unittest.TestCase):
         target_odbc_sql_endpoint,
         target_odbc_cluster,
         target_use_ssl_thrift,
+        target_use_ssl_thrift_no_user,
         base_project_cfg,
     ):
         self.base_project_cfg = base_project_cfg
         self.target_http = target_http
+        self.target_use_ssl_thrift_no_user = target_use_ssl_thrift_no_user
         self.target_odbc_with_extra_conn = target_odbc_with_extra_conn
         self.target_odbc_sql_endpoint = target_odbc_sql_endpoint
         self.target_odbc_cluster = target_odbc_cluster
@@ -100,6 +405,38 @@ class TestSparkAdapter(unittest.TestCase):
             self.assertIsNotNone(connection.handle)
             self.assertEqual(connection.credentials.schema, "analytics")
             self.assertIsNone(connection.credentials.database)
+
+    def test_build_ssl_transport_defaults_sasl_credentials(self):
+        """build_ssl_transport should default username to 'dbt' when not set so
+        puresasl PLAIN mechanism does not raise SASLError for missing username."""
+        captured = {}
+
+        def mock_sasl_client(host, mechanism, username, password):
+            captured["username"] = username
+            captured["password"] = password
+            return mock.MagicMock()
+
+        with mock.patch(
+            "dbt.adapters.spark.connections.TSSLSocket", return_value=mock.MagicMock()
+        ):
+            with mock.patch("dbt.adapters.spark.connections.thrift_sasl") as mock_thrift_sasl:
+                with mock.patch(
+                    "dbt.adapters.spark.connections.SASLClient", side_effect=mock_sasl_client
+                ):
+                    build_ssl_transport(
+                        host="localhost",
+                        port=10000,
+                        username=None,
+                        auth="NONE",
+                        kerberos_service_name=None,
+                        password=None,
+                    )
+                    # sasl_factory is the first arg passed to TSaslClientTransport
+                    sasl_factory = mock_thrift_sasl.TSaslClientTransport.call_args[0][0]
+                    sasl_factory()  # invoke to trigger SASLClient instantiation
+
+        self.assertEqual(captured["username"], "dbt")
+        self.assertEqual(captured["password"], "x")
 
     def test_thrift_connection_kerberos(self):
         adapter = SparkAdapter(self.target_thrift_kerberos, get_context("spawn"))
@@ -206,32 +543,29 @@ class TestSparkAdapter(unittest.TestCase):
 
         # Mimics the output of Spark with a DESCRIBE TABLE EXTENDED
         plain_rows = [
-            ("col1", "decimal(22,0)"),
-            (
-                "col2",
-                "string",
-            ),
-            ("dt", "date"),
-            ("struct_col", "struct<struct_inner_col:string>"),
-            ("# Partition Information", "data_type"),
-            ("# col_name", "data_type"),
-            ("dt", "date"),
-            (None, None),
-            ("# Detailed Table Information", None),
-            ("Database", None),
-            ("Owner", "root"),
-            ("Created Time", "Wed Feb 04 18:15:00 UTC 1815"),
-            ("Last Access", "Wed May 20 19:25:00 UTC 1925"),
-            ("Type", "MANAGED"),
-            ("Provider", "delta"),
-            ("Location", "/mnt/vo"),
-            ("Serde Library", "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe"),
-            ("InputFormat", "org.apache.hadoop.mapred.SequenceFileInputFormat"),
-            ("OutputFormat", "org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat"),
-            ("Partition Provider", "Catalog"),
+            ("col1", "decimal(22,0)", None),
+            ("col2", "string", None),
+            ("dt", "date", None),
+            ("struct_col", "struct<struct_inner_col:string>", None),
+            ("# Partition Information", "data_type", None),
+            ("# col_name", "data_type", None),
+            ("dt", "date", None),
+            (None, None, None),
+            ("# Detailed Table Information", None, None),
+            ("Database", None, None),
+            ("Owner", "root", None),
+            ("Created Time", "Wed Feb 04 18:15:00 UTC 1815", None),
+            ("Last Access", "Wed May 20 19:25:00 UTC 1925", None),
+            ("Type", "MANAGED", None),
+            ("Provider", "delta", None),
+            ("Location", "/mnt/vo", None),
+            ("Serde Library", "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe", None),
+            ("InputFormat", "org.apache.hadoop.mapred.SequenceFileInputFormat", None),
+            ("OutputFormat", "org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat", None),
+            ("Partition Provider", "Catalog", None),
         ]
 
-        input_cols = [Row(keys=["col_name", "data_type"], values=r) for r in plain_rows]
+        input_cols = [Row(keys=["col_name", "data_type", "comment"], values=r) for r in plain_rows]
 
         rows = SparkAdapter(self.target_http, get_context("spawn")).parse_describe_extended(
             relation, input_cols
@@ -251,6 +585,7 @@ class TestSparkAdapter(unittest.TestCase):
                 "numeric_scale": None,
                 "numeric_precision": None,
                 "char_size": None,
+                "comment": None,
             },
         )
 
@@ -268,6 +603,7 @@ class TestSparkAdapter(unittest.TestCase):
                 "numeric_scale": None,
                 "numeric_precision": None,
                 "char_size": None,
+                "comment": None,
             },
         )
 
@@ -285,6 +621,7 @@ class TestSparkAdapter(unittest.TestCase):
                 "numeric_scale": None,
                 "numeric_precision": None,
                 "char_size": None,
+                "comment": None,
             },
         )
 
@@ -302,6 +639,7 @@ class TestSparkAdapter(unittest.TestCase):
                 "numeric_scale": None,
                 "numeric_precision": None,
                 "char_size": None,
+                "comment": None,
             },
         )
 
@@ -316,12 +654,12 @@ class TestSparkAdapter(unittest.TestCase):
 
         # Mimics the output of Spark with a DESCRIBE TABLE EXTENDED
         plain_rows = [
-            ("col1", "decimal(22,0)"),
-            ("# Detailed Table Information", None),
-            ("Owner", 1234),
+            ("col1", "decimal(22,0)", None),
+            ("# Detailed Table Information", None, None),
+            ("Owner", 1234, None),
         ]
 
-        input_cols = [Row(keys=["col_name", "data_type"], values=r) for r in plain_rows]
+        input_cols = [Row(keys=["col_name", "data_type", "comment"], values=r) for r in plain_rows]
 
         rows = SparkAdapter(self.target_http, get_context("spawn")).parse_describe_extended(
             relation, input_cols
@@ -340,25 +678,25 @@ class TestSparkAdapter(unittest.TestCase):
 
         # Mimics the output of Spark with a DESCRIBE TABLE EXTENDED
         plain_rows = [
-            ("col1", "decimal(22,0)"),
-            ("# Partition Information", "data_type"),
-            (None, None),
-            ("# Detailed Table Information", None),
-            ("Database", None),
-            ("Owner", "root"),
-            ("Created Time", "Wed Feb 04 18:15:00 UTC 1815"),
-            ("Last Access", "Wed May 20 19:25:00 UTC 1925"),
-            ("Statistics", "1109049927 bytes, 14093476 rows"),
-            ("Type", "MANAGED"),
-            ("Provider", "delta"),
-            ("Location", "/mnt/vo"),
-            ("Serde Library", "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe"),
-            ("InputFormat", "org.apache.hadoop.mapred.SequenceFileInputFormat"),
-            ("OutputFormat", "org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat"),
-            ("Partition Provider", "Catalog"),
+            ("col1", "decimal(22,0)", None),
+            ("# Partition Information", "data_type", None),
+            (None, None, None),
+            ("# Detailed Table Information", None, None),
+            ("Database", None, None),
+            ("Owner", "root", None),
+            ("Created Time", "Wed Feb 04 18:15:00 UTC 1815", None),
+            ("Last Access", "Wed May 20 19:25:00 UTC 1925", None),
+            ("Statistics", "1109049927 bytes, 14093476 rows", None),
+            ("Type", "MANAGED", None),
+            ("Provider", "delta", None),
+            ("Location", "/mnt/vo", None),
+            ("Serde Library", "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe", None),
+            ("InputFormat", "org.apache.hadoop.mapred.SequenceFileInputFormat", None),
+            ("OutputFormat", "org.apache.hadoop.hive.ql.io.HiveSequenceFileOutputFormat", None),
+            ("Partition Provider", "Catalog", None),
         ]
 
-        input_cols = [Row(keys=["col_name", "data_type"], values=r) for r in plain_rows]
+        input_cols = [Row(keys=["col_name", "data_type", "comment"], values=r) for r in plain_rows]
 
         rows = SparkAdapter(self.target_http, get_context("spawn")).parse_describe_extended(
             relation, input_cols
@@ -378,6 +716,7 @@ class TestSparkAdapter(unittest.TestCase):
                 "numeric_scale": None,
                 "numeric_precision": None,
                 "char_size": None,
+                "comment": None,
                 "stats:bytes:description": "",
                 "stats:bytes:include": True,
                 "stats:bytes:label": "bytes",
@@ -393,9 +732,11 @@ class TestSparkAdapter(unittest.TestCase):
         adapter = SparkAdapter(self.target_http, get_context("spawn"))
         # fine
         adapter.Relation.create(schema="different", identifier="table")
-        with self.assertRaises(DbtRuntimeError):
-            # not fine - database set
-            adapter.Relation.create(database="something", schema="different", identifier="table")
+        # CCCS: database is now allowed on SparkRelation (cross-database/catalog support)
+        relation = adapter.Relation.create(
+            database="something", schema="different", identifier="table"
+        )
+        self.assertEqual(relation.database, "something")
 
     def test_profile_with_database(self):
         profile = {
@@ -488,6 +829,7 @@ class TestSparkAdapter(unittest.TestCase):
                 "numeric_scale": None,
                 "numeric_precision": None,
                 "char_size": None,
+                "comment": None,
                 "stats:bytes:description": "",
                 "stats:bytes:include": True,
                 "stats:bytes:label": "bytes",
@@ -509,6 +851,7 @@ class TestSparkAdapter(unittest.TestCase):
                 "numeric_scale": None,
                 "numeric_precision": None,
                 "char_size": None,
+                "comment": None,
                 "stats:bytes:description": "",
                 "stats:bytes:include": True,
                 "stats:bytes:label": "bytes",
@@ -574,6 +917,7 @@ class TestSparkAdapter(unittest.TestCase):
                 "numeric_scale": None,
                 "numeric_precision": None,
                 "char_size": None,
+                "comment": None,
             },
         )
 
@@ -591,6 +935,7 @@ class TestSparkAdapter(unittest.TestCase):
                 "numeric_scale": None,
                 "numeric_precision": None,
                 "char_size": None,
+                "comment": None,
             },
         )
 
@@ -642,6 +987,7 @@ class TestSparkAdapter(unittest.TestCase):
                 "numeric_scale": None,
                 "numeric_precision": None,
                 "char_size": None,
+                "comment": None,
                 "stats:bytes:description": "",
                 "stats:bytes:include": True,
                 "stats:bytes:label": "bytes",
@@ -667,6 +1013,7 @@ class TestSparkAdapter(unittest.TestCase):
                 "numeric_scale": None,
                 "numeric_precision": None,
                 "char_size": None,
+                "comment": None,
                 "stats:bytes:description": "",
                 "stats:bytes:include": True,
                 "stats:bytes:label": "bytes",
@@ -677,3 +1024,252 @@ class TestSparkAdapter(unittest.TestCase):
                 "stats:rows:value": 12345678,
             },
         )
+
+
+class TestListRelationsWithoutCaching(unittest.TestCase):
+    @pytest.fixture(autouse=True)
+    def set_up_fixtures(self, target_http):
+        self.target_http = target_http
+
+    def _make_adapter(self):
+        return SparkAdapter(self.target_http, get_context("spawn"))
+
+    def _make_schema_relation(self, adapter, schema="analytics"):
+        return adapter.Relation.create(schema=schema, identifier="").without_identifier()
+
+    def test_unknown_error_is_raised(self):
+        """An unexpected error from the metastore should propagate rather than
+        silently returning an empty list, which would cause incremental models
+        to recreate tables and lose data (issue #1289)."""
+        adapter = self._make_adapter()
+        schema_relation = self._make_schema_relation(adapter)
+
+        with mock.patch.object(
+            adapter,
+            "execute_macro",
+            side_effect=DbtRuntimeError("Connection to Hive Metastore failed"),
+        ):
+            with self.assertRaises(DbtRuntimeError):
+                adapter.list_relations_without_caching(schema_relation)
+
+    def test_schema_not_found_returns_empty(self):
+        """When the schema/database genuinely does not exist (legacy Hive
+        'Database not found' message), an empty list should be returned."""
+        adapter = self._make_adapter()
+        schema_relation = self._make_schema_relation(adapter, schema="nonexistent")
+
+        with mock.patch.object(
+            adapter,
+            "execute_macro",
+            side_effect=DbtRuntimeError("Database not found"),
+        ):
+            result = adapter.list_relations_without_caching(schema_relation)
+            self.assertEqual(result, [])
+
+
+@pytest.mark.parametrize("not_found_msg", SCHEMA_NOT_FOUND_MESSAGES)
+def test_all_schema_not_found_messages_return_empty(not_found_msg, target_http):
+    """Every message in SCHEMA_NOT_FOUND_MESSAGES should cause
+    list_relations_without_caching to return [] rather than raise.
+    This covers engine-specific variants such as Spark SQL's [SCHEMA_NOT_FOUND]."""
+    adapter = SparkAdapter(target_http, get_context("spawn"))
+    schema_relation = adapter.Relation.create(
+        schema="nonexistent", identifier=""
+    ).without_identifier()
+
+    with mock.patch.object(
+        adapter,
+        "execute_macro",
+        side_effect=DbtRuntimeError(not_found_msg),
+    ):
+        result = adapter.list_relations_without_caching(schema_relation)
+        assert result == []
+
+
+@pytest.mark.parametrize("not_found_msg", TABLE_OR_VIEW_NOT_FOUND_MESSAGES)
+def test_all_table_or_view_not_found_messages_return_empty(not_found_msg, target_http):
+    """Every message in TABLE_OR_VIEW_NOT_FOUND_MESSAGES should cause
+    list_relations_without_caching to return [] rather than raise.
+    This covers Databricks/Simba errors like [TABLE_OR_VIEW_NOT_FOUND] that
+    surface when a schema has no matching tables."""
+    adapter = SparkAdapter(target_http, get_context("spawn"))
+    schema_relation = adapter.Relation.create(
+        schema="nonexistent", identifier=""
+    ).without_identifier()
+
+    with mock.patch.object(
+        adapter,
+        "execute_macro",
+        side_effect=DbtRuntimeError(not_found_msg),
+    ):
+        result = adapter.list_relations_without_caching(schema_relation)
+        assert result == []
+
+
+ICEBERG_V2_ERROR = "SHOW TABLE EXTENDED is not supported for v2 tables"
+
+
+class TestListRelationsIcebergV2Fallback(unittest.TestCase):
+    """Tests for the Iceberg v2 fallback path inside list_relations_without_caching.
+
+    When the primary SHOW TABLE EXTENDED macro raises the v2-table error, the adapter
+    falls back to a SHOW TABLES macro.  Unexpected errors from *that* fallback should
+    propagate rather than be swallowed.
+    """
+
+    @pytest.fixture(autouse=True)
+    def set_up_fixtures(self, target_http):
+        self.target_http = target_http
+
+    def _make_adapter(self):
+        return SparkAdapter(self.target_http, get_context("spawn"))
+
+    def _make_schema_relation(self, adapter, schema="analytics"):
+        return adapter.Relation.create(schema=schema, identifier="").without_identifier()
+
+    def test_iceberg_v2_fallback_returns_relations(self):
+        """When the primary macro raises the v2-table error, the fallback SHOW TABLES
+        macro is called and its results are returned successfully."""
+        adapter = self._make_adapter()
+        schema_relation = self._make_schema_relation(adapter)
+
+        fallback_rows = mock.MagicMock()
+        fallback_rows.__iter__ = mock.Mock(return_value=iter([]))
+
+        def execute_macro_side_effect(macro_name, *args, **kwargs):
+            if macro_name == LIST_RELATIONS_MACRO_NAME:
+                raise DbtRuntimeError(ICEBERG_V2_ERROR)
+            return fallback_rows
+
+        with mock.patch.object(adapter, "execute_macro", side_effect=execute_macro_side_effect):
+            with mock.patch.object(
+                adapter, "_build_spark_relation_list", return_value=[]
+            ) as mock_build:
+                result = adapter.list_relations_without_caching(schema_relation)
+                self.assertEqual(result, [])
+                mock_build.assert_called_once()
+
+    def test_iceberg_v2_fallback_error_propagates(self):
+        """If the fallback SHOW TABLES macro itself raises an unexpected error, that
+        error should propagate rather than being silently swallowed."""
+        adapter = self._make_adapter()
+        schema_relation = self._make_schema_relation(adapter)
+
+        def execute_macro_side_effect(macro_name, *args, **kwargs):
+            if macro_name == LIST_RELATIONS_MACRO_NAME:
+                raise DbtRuntimeError(ICEBERG_V2_ERROR)
+            raise DbtRuntimeError("Unexpected fallback failure")
+
+        with mock.patch.object(adapter, "execute_macro", side_effect=execute_macro_side_effect):
+            with self.assertRaises(DbtRuntimeError):
+                adapter.list_relations_without_caching(schema_relation)
+
+
+class TestGetColumnsForCatalogIcebergFallback(unittest.TestCase):
+    """Tests for _get_columns_for_catalog falling back to get_columns_in_relation
+    when the information string (from the DESCRIBE EXTENDED / Iceberg v2 path)
+    does not contain column definitions in the regex-parseable format."""
+
+    @pytest.fixture(autouse=True)
+    def set_up_fixtures(self, target_http):
+        self.target_http = target_http
+
+    def _make_adapter(self):
+        return SparkAdapter(self.target_http, get_context("spawn"))
+
+    def test_falls_back_to_get_columns_in_relation(self):
+        """When parse_columns_from_information returns nothing,
+        _get_columns_for_catalog should fall back to get_columns_in_relation."""
+        adapter = self._make_adapter()
+
+        # Information string with no ' |-- col: type (nullable = ...)' lines,
+        # so parse_columns_from_information will return an empty list.
+        information = "id: int\n" "name: string\n" "Provider: iceberg\n" "Owner: root\n"
+        relation = SparkRelation.create(
+            schema="default",
+            identifier="orders",
+            type=SparkRelation.get_relation_type.Table,
+            information=information,
+        )
+
+        fallback_columns = [
+            SparkColumn(
+                table_database=None,
+                table_schema="default",
+                table_name="orders",
+                table_type=SparkRelation.get_relation_type.Table,
+                column_index=0,
+                table_owner="root",
+                column="id",
+                dtype="int",
+            ),
+            SparkColumn(
+                table_database=None,
+                table_schema="default",
+                table_name="orders",
+                table_type=SparkRelation.get_relation_type.Table,
+                column_index=1,
+                table_owner="root",
+                column="name",
+                dtype="string",
+            ),
+        ]
+
+        with mock.patch.object(
+            adapter, "get_columns_in_relation", return_value=fallback_columns
+        ) as mock_get_cols:
+            result = list(adapter._get_columns_for_catalog(relation))
+
+        mock_get_cols.assert_called_once_with(relation)
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["column_name"], "id")
+        self.assertEqual(result[0]["column_type"], "int")
+        self.assertEqual(result[1]["column_name"], "name")
+        self.assertEqual(result[1]["column_type"], "string")
+
+    def test_does_not_fall_back_when_information_has_columns(self):
+        """When parse_columns_from_information succeeds (SHOW TABLE EXTENDED path),
+        get_columns_in_relation should NOT be called."""
+        adapter = self._make_adapter()
+
+        # Standard information string with the regex-parseable format
+        information = (
+            "Owner: root\n"
+            "Schema: root\n"
+            " |-- id: int (nullable = true)\n"
+            " |-- name: string (nullable = true)\n"
+        )
+        relation = SparkRelation.create(
+            schema="default",
+            identifier="orders",
+            type=SparkRelation.get_relation_type.Table,
+            information=information,
+        )
+
+        with mock.patch.object(adapter, "get_columns_in_relation") as mock_get_cols:
+            result = list(adapter._get_columns_for_catalog(relation))
+
+        mock_get_cols.assert_not_called()
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["column_name"], "id")
+        self.assertEqual(result[1]["column_name"], "name")
+
+    def test_fallback_swallows_runtime_error(self):
+        """If the fallback get_columns_in_relation raises DbtRuntimeError"""
+        adapter = self._make_adapter()
+
+        relation = SparkRelation.create(
+            schema="default",
+            identifier="orders",
+            type=SparkRelation.get_relation_type.Table,
+            information="Provider: iceberg\n",
+        )
+
+        with mock.patch.object(
+            adapter,
+            "get_columns_in_relation",
+            side_effect=DbtRuntimeError("describe failed"),
+        ):
+            result = list(adapter._get_columns_for_catalog(relation))
+
+        self.assertEqual(result, [])

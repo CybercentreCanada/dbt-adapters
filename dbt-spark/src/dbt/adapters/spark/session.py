@@ -18,6 +18,14 @@ logger = AdapterLogger("Spark")
 NUMBERS = DECIMALS + (int, float)
 
 
+# CCCS share configured session acquisition with catalog detection.
+def get_spark_session(server_side_parameters: Dict[str, Any]) -> SparkSession:
+    builder = SparkSession.builder
+    for parameter, value in server_side_parameters.items():
+        builder = builder.config(parameter, value)
+    return builder.getOrCreate()
+
+
 class Cursor:
     """
     Mock a pyodbc cursor.
@@ -113,13 +121,7 @@ class Cursor:
         if len(parameters) > 0:
             sql = sql % parameters
 
-        # CCCS
-        builder = SparkSession.builder
-
-        for parameter, value in self.server_side_parameters.items():
-            builder = builder.config(parameter, value)
-
-        spark_session = builder.getOrCreate()
+        spark_session = get_spark_session(self.server_side_parameters)
 
         try:
             self._df = spark_session.sql(sql)

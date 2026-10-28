@@ -3,11 +3,14 @@
 {%- endmacro -%}
 
 {% macro spark__tblproperties_clause() -%}
-  {%- set tblproperties = config.get('tblproperties') -%}
-  {%- if tblproperties is not none %}
+  {%- if (config.get('file_format', validator=validation.any[basestring]) or 'iceberg') != 'iceberg' -%}
+    {{ return('') }}
+  {%- endif -%}
+  {%- set tblproperties = spark__filtered_tblproperties(config.get('tblproperties')) -%}
+  {%- if tblproperties is not none and tblproperties | length > 0 %}
     tblproperties (
       {%- for prop in tblproperties -%}
-      '{{ prop }}' = '{{ tblproperties[prop] }}' {% if not loop.last %}, {% endif %}
+      '{{ prop }}' = '{{ spark__escape_single_quotes(tblproperties[prop]) }}' {% if not loop.last %}, {% endif %}
       {%- endfor %}
     )
   {%- endif %}
@@ -18,10 +21,8 @@
 {%- endmacro -%}
 
 {% macro spark__file_format_clause() %}
-  {%- set file_format = config.get('file_format', validator=validation.any[basestring]) -%}
-  {%- if file_format is not none %}
-    using {{ file_format }}
-  {%- endif %}
+  {%- set file_format = config.get('file_format', validator=validation.any[basestring]) or 'iceberg' -%}
+  using {{ file_format }}
 {%- endmacro -%}
 
 
@@ -29,13 +30,32 @@
   {{ return(adapter.dispatch('location_clause', 'dbt')()) }}
 {%- endmacro -%}
 
+{% macro spark__validate_streaming_options_config(materialization) %}
+  {%- for option_name in ('read_stream_options', 'write_stream_options') -%}
+    {%- if config.get(option_name) is not none -%}
+      {{ exceptions.raise_compiler_error("'" ~ option_name ~ "' is only supported for materialized='streaming'; remove it from this " ~ materialization ~ " model.") }}
+    {%- endif -%}
+  {%- endfor -%}
+{% endmacro %}
+
 {% macro spark__location_clause() %}
   {%- set location_root = config.get('location_root', validator=validation.any[basestring]) -%}
   {%- set identifier = model['alias'] -%}
   {%- if location_root is not none %}
     location '{{ location_root }}/{{ identifier }}'
-  {%- else %}
-    {{ exceptions.raise_compiler_error("location_root is required for location_clause") }}
+  {%- elif adapter.behavior.require_location_root %}
+    {{ exceptions.raise_compiler_error("location_root is required for model '" ~ identifier ~ "'. Set location_root in your model config or disable the require_location_root flag.") }}
+  {%- endif %}
+{%- endmacro -%}
+
+{% macro python__location_clause() %}
+  {%- set location_root = config.get('location_root', validator=validation.any[basestring]) -%}
+  {%- set identifier = model['alias'] -%}
+  {%- if location_root is not none -%}
+target_location = {{ (location_root ~ '/' ~ identifier) | tojson }}
+writer = writer.option("location", target_location)
+  {%- elif adapter.behavior.require_location_root %}
+    {{ exceptions.raise_compiler_error("location_root is required for model '" ~ identifier ~ "'. Set location_root in your model config or disable the require_location_root flag.") }}
   {%- endif %}
 {%- endmacro -%}
 
@@ -150,7 +170,7 @@
     {%- if temporary -%}
       {{ create_temporary_view(relation, compiled_code) }}
     {%- else -%}
-      {% if config.get('file_format', validator=validation.any[basestring]) in ['delta', 'iceberg'] %}
+      {% if (config.get('file_format', validator=validation.any[basestring]) or 'iceberg') in ['delta', 'iceberg'] %}
         create or replace table {{ relation }}
       {% else %}
         create table {{ relation }}
@@ -195,7 +215,7 @@
 
 {% macro spark__persist_constraints(relation, model) %}
   {%- set contract_config = config.get('contract') -%}
-  {% if contract_config.enforced and config.get('file_format', 'delta') == 'delta' %}
+  {% if contract_config.enforced and (config.get('file_format') or 'iceberg') == 'delta' %}
     {% do alter_table_add_constraints(relation, model.constraints) %}
     {% do alter_column_set_constraints(relation, model.columns) %}
   {% endif %}
@@ -358,9 +378,26 @@
 {% endmacro %}
 
 {% macro spark__persist_docs(relation, model, for_relation, for_columns) -%}
-  {% if for_columns and config.persist_column_docs() and model.columns %}
-    {% do alter_column_comment(relation, model.columns) %}
+  {%- set check_relation = for_relation and config.persist_relation_docs() -%}
+  {%- set check_columns = for_columns and config.persist_column_docs() and model.columns -%}
+  {% if check_relation or check_columns %}
+    {%- set diff = adapter.get_persist_docs_diff(relation, model.description, model.columns, check_relation, check_columns) -%}
+    {% if diff is not none %}
+      {% if diff.relation_comment is not none %}
+        {% do alter_relation_comment(relation, diff.relation_comment) %}
+      {% endif %}
+      {% if diff.columns %}
+        {% do alter_column_comment(relation, diff.columns) %}
+      {% endif %}
+    {% endif %}
   {% endif %}
+{% endmacro %}
+
+{% macro spark__alter_relation_comment(relation, relation_comment) %}
+  {{ log('Updating table comment on ' ~ relation) }}
+  {% call statement('alter_relation_comment') -%}
+    comment on table {{ relation }} is '{{ spark__escape_single_quotes(relation_comment) }}'
+  {%- endcall %}
 {% endmacro %}
 
 {% macro spark__alter_column_comment(relation, column_dict) %}

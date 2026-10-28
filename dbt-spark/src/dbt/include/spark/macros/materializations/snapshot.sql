@@ -88,11 +88,14 @@
 
 {% materialization snapshot, adapter='spark' %}
 
+  {% do spark__validate_streaming_options_config('snapshot') %}
+
   {%- set target_table = model.get('alias', model.get('name')) -%}
 
   {%- set strategy_name = config.get('strategy') -%}
   {%- set unique_key = config.get('unique_key') %}
-  {%- set file_format = config.get('file_format') or 'parquet' -%}
+  {%- set file_format = config.get('file_format') or 'iceberg' -%}
+  {% do dbt_spark_validate_partition_by(config.get('partition_by'), file_format, 'sql', false, 'snapshot') %}
   {%- set grant_config = config.get('grants') -%}
 
   {# CCCS -- make sure to pass in the database part #}
