@@ -1,8 +1,9 @@
 import os
 import re
 import threading
+from pathlib import Path
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import (
     Any,
     Dict,
@@ -16,6 +17,8 @@ from typing import (
     Set,
     FrozenSet,
     TYPE_CHECKING,
+    Mapping,
+    Sequence,
 )
 
 from dbt.adapters.base.relation import InformationSchema
@@ -46,6 +49,14 @@ from dbt.adapters.spark.relation_configs.tblproperties import (
 )
 from dbt.adapters.spark.relation_configs.partitions import (
     PartitionProcessor,
+)
+from dbt.adapters.spark.relation_configs import write_order as write_order_module
+from dbt.adapters.spark.relation_configs.write_order import (
+    CurrentWriteOrder,
+    WriteOrder,
+    WriteOrderManager,
+    quote_identifier,
+    sql_string,
 )
 from dbt.adapters.spark.python_submissions import (
     JobClusterPythonJobHelper,
@@ -185,6 +196,7 @@ class SparkConfig(AdapterConfig):
     trigger: Optional[str] = None
     write_stream_options: Optional[Dict[str, str]] = None
     read_stream_options: Optional[Dict[str, str]] = None
+    write_order: Optional[List[str]] = None
 
 
 class SparkAdapter(SQLAdapter):
@@ -352,7 +364,7 @@ class SparkAdapter(SQLAdapter):
         information = ""
         for info_row in table_results:
             info_type, info_value, _ = info_row
-            if not info_type.startswith("#"):
+            if not info_type.startswith("#") or info_type == KEY_DETAILED_TABLE_INFORMATION:
                 information += f"{info_type}: {info_value}\n"
 
         return _schema, name, information
@@ -399,6 +411,11 @@ class SparkAdapter(SQLAdapter):
                 is_delta=is_delta,
                 is_iceberg=is_iceberg,
                 is_hudi=is_hudi,
+                write_order=asdict(
+                    CurrentWriteOrder.from_describe(
+                        [line.split(": ", 1) for line in information.splitlines() if ": " in line]
+                    )
+                ),
             )
             relations.append(relation)
 
@@ -916,6 +933,169 @@ class SparkAdapter(SQLAdapter):
     def debug_query(self) -> None:
         """Override for DebugTask method"""
         self.execute("select 1 as id")
+
+    @available
+    def validate_write_order_config(
+        self, config: Mapping[str, Any], model_name: str = "model"
+    ) -> WriteOrder:
+        missing = object()
+        value = config.get("write_order", missing)
+        if value is missing:
+            return WriteOrder()
+        try:
+            order = WriteOrder.from_config(value)
+            if (config.get("file_format") or "iceberg") != "iceberg":
+                raise ValueError("write_order is only supported for Iceberg models")
+            if config.get("materialized") not in ("table", "incremental"):
+                raise ValueError(
+                    "write_order is only supported for batch table/incremental models"
+                )
+            return order
+        except ValueError as exc:
+            raise CompilationError(f"Invalid write_order for model {model_name}: {exc}") from exc
+
+    def _write_order_execute(self, sql: str) -> Sequence[Sequence[Any]]:
+        _, table = self.execute(sql, fetch=True)
+        return list(table.rows)
+
+    def pre_model_hook(self, config: Mapping[str, Any]) -> Any:
+        self.validate_write_order_config(config, config.get("alias") or "model")
+        return super().pre_model_hook(config)
+
+    @staticmethod
+    def _write_order_target(relation: BaseRelation) -> str:
+        return ".".join(
+            quote_identifier(part)
+            for key, part in (
+                ("database", relation.database),
+                ("schema", relation.schema),
+                ("identifier", relation.identifier),
+            )
+            if part and getattr(relation.include_policy, key)
+        )
+
+    @available.parse(lambda *a, **k: False)
+    def write_order_enabled(
+        self, relation: Optional[BaseRelation], config: Mapping[str, Any]
+    ) -> bool:
+        self.validate_write_order_config(config)
+        explicit = "write_order" in config
+        if (config.get("file_format") or "iceberg") != "iceberg":
+            return False
+        properties = config.get("tblproperties") or {}
+        try:
+            return WriteOrderManager(self._write_order_execute).enabled(
+                self._write_order_target(relation) if relation else None, explicit, properties
+            )
+        except (ValueError, KeyError, StopIteration) as exc:
+            raise DbtRuntimeError(f"Cannot configure write_order for {relation}: {exc}") from exc
+
+    @available.parse(lambda *a, **k: None)
+    def get_write_order_relation(self, relation: SparkRelation) -> SparkRelation:
+        try:
+            current = WriteOrderManager(self._write_order_execute).current(
+                self._write_order_target(relation)
+            )
+        except (ValueError, KeyError, StopIteration) as exc:
+            raise DbtRuntimeError(f"Cannot establish write_order for {relation}: {exc}") from exc
+        return replace(relation, write_order=current)
+
+    @available.parse(lambda *a, **k: None)
+    def sync_write_order(
+        self, relation: SparkRelation, config: Mapping[str, Any]
+    ) -> SparkRelation:
+        desired = self.validate_write_order_config(config)
+        try:
+            current = WriteOrderManager(self._write_order_execute).sync(
+                self._write_order_target(relation), desired
+            )
+        except (ValueError, KeyError, StopIteration) as exc:
+            raise DbtRuntimeError(f"Cannot synchronize write_order for {relation}: {exc}") from exc
+        return replace(relation, write_order=current)
+
+    @available.parse(lambda *a, **k: None)
+    def validate_write_order_schema(
+        self, relation: BaseRelation, source: BaseRelation, config: Mapping[str, Any]
+    ) -> None:
+        desired = self.validate_write_order_config(config)
+        manager = WriteOrderManager(self._write_order_execute)
+        target = self._write_order_target(relation)
+        source_name = self._write_order_target(source)
+
+        def create_empty(name: str, owner: str) -> None:
+            version = manager.metadata(target)["format-version"]
+            manager.execute(
+                f"CREATE TABLE {name} USING iceberg "
+                f"TBLPROPERTIES ('format-version'={sql_string(str(version))}, "
+                f"'dbt.write-order-owner'={sql_string(owner)}) "
+                f"AS SELECT * FROM {source_name} WHERE false"
+            )
+
+        try:
+            manager.validate_on_probe(target, desired, create_empty)
+        except (ValueError, KeyError, StopIteration, RuntimeError) as exc:
+            raise DbtRuntimeError(f"Invalid write_order schema for {relation}: {exc}") from exc
+
+    @available
+    def write_order_python_code(self) -> str:
+        return Path(write_order_module.__file__).read_text(encoding="utf-8")
+
+    @available.parse(lambda *a, **k: None)
+    def materialize_write_order_sql(
+        self,
+        relation: BaseRelation,
+        query: str,
+        clauses: str,
+        location: str,
+        config: Mapping[str, Any],
+        exists: bool,
+    ) -> AdapterResponse:
+        desired = self.validate_write_order_config(config)
+        properties = {
+            str(key): str(value)
+            for key, value in (config.get("tblproperties") or {}).items()
+            if not key.startswith("polaris_")
+        }
+        target = self._write_order_target(relation)
+        query = query.strip().rstrip(";")
+        manager = WriteOrderManager(self._write_order_execute)
+        response: Optional[AdapterResponse] = None
+        if exists and "format-version" not in properties:
+            properties["format-version"] = str(manager.metadata(target)["format-version"])
+
+        def create_empty(name: str, owner: str) -> None:
+            props = dict(properties, **{"dbt.write-order-owner": owner})
+            rendered = ", ".join(f"{sql_string(k)} = {sql_string(v)}" for k, v in props.items())
+            manager.execute(
+                f"CREATE TABLE {name} {clauses} {location if name == target else ''} "
+                f"TBLPROPERTIES ({rendered}) "
+                f"AS SELECT * FROM ({query}) AS __dbt_schema WHERE false"
+            )
+
+        def write(replace: bool) -> None:
+            nonlocal response
+            if replace:
+                rendered = ", ".join(
+                    f"{sql_string(k)} = {sql_string(v)}" for k, v in properties.items()
+                )
+                props = f"TBLPROPERTIES ({rendered})" if rendered else ""
+                response, _ = self.execute(
+                    f"CREATE OR REPLACE TABLE {target} {clauses} {location} {props} AS {query}"
+                )
+            else:
+                response, _ = self.execute(f"INSERT INTO {target} {query}")
+
+        try:
+            manager.materialize(target, desired, exists, create_empty, write)
+        except (ValueError, KeyError, StopIteration, RuntimeError) as exc:
+            raise DbtRuntimeError(
+                f"write_order materialization of {target} failed: {exc}"
+            ) from exc
+        if response is None:
+            raise DbtRuntimeError(
+                f"write_order materialization of {target} did not write model data"
+            )
+        return response
 
     @available.parse(lambda *a, **k: None)
     def get_tblproperties_diff(

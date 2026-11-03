@@ -1,0 +1,3 @@
+kind: Features
+body: 'CCCS: Add Iceberg write_order configuration for batch SQL and Python models on Spark 4.0.x and Iceberg formats v2/v3, including drift synchronization, unordered resets, and atomic replacement semantics.'
+time: 2026-11-03T10:20:12.043014525-05:00

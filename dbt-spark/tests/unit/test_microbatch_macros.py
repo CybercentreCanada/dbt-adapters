@@ -187,7 +187,12 @@ class TestMicrobatchMacros(unittest.TestCase):
             "adapter.claim_metadata_sync(target_relation, invocation_id)",
             source,
         )
-        gate = source.index("{%- if sync_metadata -%}")
+        gate = source.index("{%- if sync_metadata and not evolve_write_order -%}")
+        self.assertIn("{% if sync_metadata and evolve_write_order %}", source)
+        self.assertLess(
+            source.index("adapter.validate_write_order_schema"),
+            source.index("do process_schema_changes"),
+        )
         self.assertLess(
             source.index("dbt_spark_validate_partition_by(partition_by, file_format"),
             source.index("sync_metadata ="),

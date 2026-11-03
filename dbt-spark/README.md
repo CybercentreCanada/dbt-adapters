@@ -221,6 +221,94 @@ physical incremental staging tables, and to sink creation for both Python and SQ
 streaming models. Temporary-view staging does not apply partition transforms.
 SQL partition syntax and microbatch processing windows are unchanged.
 
+### Iceberg Write Order
+
+Batch SQL and Python `table` and `incremental` models can configure Iceberg write
+ordering on **Spark 4.0.x** and **Iceberg table formats v2/v3**:
+
+```sql
+{{ config(
+    materialized='incremental',
+    file_format='iceberg',
+    write_order=['customer_id ASC NULLS LAST', 'total DESC']
+) }}
+
+select customer_id, total from {{ ref('source_orders') }}
+```
+
+```python
+def model(dbt, spark):
+    dbt.config(
+        materialized="table",
+        file_format="iceberg",
+        submission_method="spark_session_based_cluster",
+        write_order=["customer_id ASC NULLS LAST", "total DESC"],
+    )
+    return dbt.ref("source_orders")
+```
+
+`write_order` must be a list of column references with optional direction and null
+placement. Backtick-quoted and nested references are supported. Direction defaults
+to `ASC`; null placement defaults to `NULLS FIRST` for ascending terms and
+`NULLS LAST` for descending terms. Equivalent configurations do not cause an ALTER.
+Column sequence is significant. Scalar strings, nulls, blank entries, duplicate
+references, transforms, and arbitrary SQL expressions are rejected.
+
+On supported targets, **omitting `write_order` or setting it to `[]` means
+`WRITE UNORDERED`**, including clearing an order from an earlier run. Changed
+policies are synchronized using `ALTER TABLE ... WRITE ORDERED BY ...` or
+`ALTER TABLE ... WRITE UNORDERED`. No historical data rewrite is initiated, and
+write order does not guarantee SELECT result ordering.
+
+- New targets are schema-created, configured, then populated. Validation uses an
+  isolated empty probe table before target mutation. Failed initial configuration
+  or insertion removes only a newly created table owned by that operation.
+  This path does not guarantee atomic publication to concurrent readers.
+- Existing incremental targets synchronize before target data writes; internal
+  staging relations do not inherit the target order. Microbatch uses the existing
+  once-per-target metadata synchronization guard; a failed first synchronization
+  prevents later batches from writing.
+- With `on_schema_change='append_new_columns'` or `'sync_all_columns'`, new sort
+  columns are validated against an isolated staging-schema probe before target
+  mutation. Target schema changes precede order synchronization and data writes.
+  Invalid references leave target schema and metadata unchanged. Existing
+  restrictions on dropping Iceberg columns remain unchanged.
+- Existing table replacements and full refreshes remain atomic. **Their initial
+  replacement write is an exception: the desired policy is applied afterward.**
+  A failed replacement write preserves the old table. If replacement succeeds
+  but the subsequent ordering ALTER fails, dbt fails explicitly and leaves the
+  replacement in place without attempting rollback.
+- Current order is captured from DESCRIBE metadata and resolved using authoritative
+  Iceberg metadata when needed. Incomplete or ambiguous metadata is never silently
+  treated as unordered.
+
+Prerequisites include preconfigured Iceberg SQL extensions, a matching runtime
+artifact, catalog CREATE/DROP permissions for isolated probe tables, and Spark
+read access to the catalog's metadata JSON files. Atomic replacement requires
+`org.apache.iceberg.spark.SparkCatalog`, not `SparkSessionCatalog`. The tested
+baseline is Spark **4.0.3**, Scala **2.13**, Iceberg library **1.10.0**
+(`org.apache.iceberg:iceberg-spark-runtime-4.0_2.13:1.10.0`), with a Hadoop catalog.
+Other catalogs and Spark 4.x minor lines require separate verification.
+
+Iceberg table format versions are not library versions. Existing
+`tblproperties={'format-version': '3'}` configuration can select v3 for creation;
+this feature does not automatically upgrade tables or change format defaults.
+Explicit `write_order`, including `[]`, is rejected on unsupported runtimes/formats,
+non-Iceberg models, views, ephemeral models, and streaming materializations.
+Omission on unsupported surfaces preserves their existing behavior.
+
+Run the dedicated live matrix with Java 17 and:
+
+```shell
+cd dbt-spark
+hatch run write-order-tests:test
+```
+
+`DBT_ICEBERG_JAR` may point to a preinstalled matching runtime JAR instead of
+resolving the artifact through Maven. See the
+[write-order specification](specs/spec-design-iceberg-write-order.md) for the full
+configuration and failure contracts.
+
 ### Partition Drift Detection
 
 Two behavior flags enable detection of partition spec drift between model config and the existing Iceberg table:

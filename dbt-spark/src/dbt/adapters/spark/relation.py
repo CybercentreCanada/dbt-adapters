@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 
 from dbt.adapters.base.relation import BaseRelation, Policy
 from dbt.adapters.events.logging import AdapterLogger
+from dbt.adapters.spark.relation_configs.write_order import CurrentWriteOrder
 
 logger = AdapterLogger("Spark")
 
@@ -35,6 +36,7 @@ class SparkRelation(BaseRelation):
     # TODO: make this a dict everywhere
     information: Optional[str] = None
     require_alias: bool = False
+    write_order: CurrentWriteOrder = field(default_factory=CurrentWriteOrder)
 
     # CCCS
     def __post_init__(self) -> None:

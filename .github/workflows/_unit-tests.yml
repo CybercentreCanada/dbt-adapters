@@ -119,3 +119,10 @@ jobs:
             - name: "Run unit tests"
               run: hatch run ${{ inputs.hatch-env }}:unit-tests
               working-directory: ./${{ inputs.package }}
+
+            - name: "Verify Spark Iceberg write ordering"
+              if: inputs.package == 'dbt-spark' && runner.os == 'Linux'
+              run: |
+                  export JAVA_HOME="${JAVA_HOME_17_X64:-$JAVA_HOME}"
+                  hatch run write-order-tests:test
+              working-directory: ./dbt-spark

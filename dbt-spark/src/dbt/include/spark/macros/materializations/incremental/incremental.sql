@@ -18,6 +18,13 @@
   {%- set incremental_predicates = config.get('predicates', none) or config.get('incremental_predicates', none) -%}
   {%- set target_relation = this -%}
   {%- set existing_relation = load_relation(this) -%}
+  {%- set write_order_enabled = adapter.write_order_enabled(existing_relation, model.config) -%}
+  {% if write_order_enabled %}
+    {% set target_relation = target_relation.incorporate(type='table', is_iceberg=true) %}
+    {% if existing_relation is not none %}
+      {% set existing_relation = existing_relation.incorporate(is_iceberg=true) %}
+    {% endif %}
+  {% endif %}
 
   {#--
     Metadata mutations (partition check, tblproperties, comments) race when microbatch
@@ -82,25 +89,51 @@
   {#-- Incremental run logic --#}
   {%- if existing_relation is none -%}
     {#-- Relation must be created --#}
+    {% if write_order_enabled %}
+      {% if language == 'python' %}
+        {% call statement('main', language='python') %}
+          {{ py_write_table(compiled_code, target_relation, false, true, false) }}
+        {% endcall %}
+      {% else %}
+        {% do spark_materialize_write_order_sql(target_relation, compiled_code, false) %}
+      {% endif %}
+      {% set target_relation = adapter.get_write_order_relation(target_relation) %}
+    {% else %}
     {%- call statement('main', language=language) -%}
       {{ create_table_as(False, target_relation, compiled_code, language) }}
     {%- endcall -%}
+    {% endif %}
     {% do persist_constraints(target_relation, model) %}
     {% do apply_tblproperties(target_relation, config.get('tblproperties')) %}
   {%- elif existing_relation.is_view or should_full_refresh() -%}
     {#-- Relation must be dropped & recreated --#}
     {% set is_delta = (file_format == 'delta' and existing_relation.is_delta) %}
-    {% if not is_delta %} {#-- If Delta, we will `create or replace` below, so no need to drop --#}
+    {% if not write_order_enabled and not is_delta %} {#-- Atomic Iceberg replacements must not drop first. --#}
       {% do adapter.drop_relation(existing_relation) %}
     {% endif %}
+    {% if write_order_enabled %}
+      {% if language == 'python' %}
+        {% call statement('main', language='python') %}
+          {{ py_write_table(compiled_code, target_relation, false, true, true) }}
+        {% endcall %}
+      {% else %}
+        {% do spark_materialize_write_order_sql(target_relation, compiled_code, true) %}
+      {% endif %}
+      {% set target_relation = adapter.get_write_order_relation(target_relation) %}
+    {% else %}
     {%- call statement('main', language=language) -%}
       {{ create_table_as(False, target_relation, compiled_code, language) }}
     {%- endcall -%}
+    {% endif %}
     {% do persist_constraints(target_relation, model) %}
     {% do apply_tblproperties(target_relation, config.get('tblproperties')) %}
   {%- else -%}
     {#-- Relation must be merged --#}
-    {%- if sync_metadata -%}
+    {% set evolve_write_order = write_order_enabled and on_schema_change in ('append_new_columns', 'sync_all_columns') %}
+    {%- if sync_metadata and not evolve_write_order -%}
+      {% if write_order_enabled %}
+        {% set target_relation = adapter.sync_write_order(target_relation, model.config) %}
+      {% endif %}
       {% do adapter.check_partition_sync(target_relation, config.get('file_format'), config.get('partition_by')) %}
       {% do sync_tblproperties(target_relation, config.get('tblproperties')) %}
     {%- endif -%}
@@ -108,7 +141,15 @@
       {#-- CCCS --#}
       {{ create_table_as(use_temporary_view, tmp_relation, compiled_code, language) }}
     {%- endcall -%}
+    {% if sync_metadata and evolve_write_order %}
+      {% do adapter.validate_write_order_schema(target_relation, tmp_relation, model.config) %}
+      {% do adapter.check_partition_sync(target_relation, config.get('file_format'), config.get('partition_by')) %}
+      {% do sync_tblproperties(target_relation, config.get('tblproperties')) %}
+    {% endif %}
     {%- do process_schema_changes(on_schema_change, tmp_relation, existing_relation) -%}
+    {% if sync_metadata and evolve_write_order %}
+      {% set target_relation = adapter.sync_write_order(target_relation, model.config) %}
+    {% endif %}
     {%- call statement('main') -%}
       {{ dbt_spark_get_incremental_sql(strategy, tmp_relation, target_relation, existing_relation, unique_key, incremental_predicates) }}
     {%- endcall -%}

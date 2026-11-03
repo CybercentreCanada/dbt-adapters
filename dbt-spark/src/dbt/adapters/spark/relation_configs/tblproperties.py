@@ -15,7 +15,13 @@ if TYPE_CHECKING:
 IGNORE_PREFIXES = ("polaris_",)
 
 # CCCS exact property names that should also be ignored during comparison and sync.
-IGNORE_PROPERTIES: List[str] = ["current-snapshot-id", "format", "format-version", "tblproperties"]
+IGNORE_PROPERTIES: List[str] = [
+    "current-snapshot-id",
+    "format",
+    "format-version",
+    "tblproperties",
+    "sort-order",
+]
 
 
 def _filter_properties(props: Dict[str, str]) -> Dict[str, str]:

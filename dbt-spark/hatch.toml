@@ -40,13 +40,31 @@ docker-prod = "docker build -f docker/Dockerfile -t dbt-spark ."
 detached = true
 dependencies = [
     "jinja2>=3.1,<4.0",
-    "pyspark==3.5.6",
+    "pyspark==4.1.3",
     "pytest>=7.0,<8.0",
     "pytest-xdist",
 ]
 
 [envs.local-spark-tests.scripts]
 test = "DBT_RUN_LOCAL_SPARK_TESTS=1 python -m pytest --noconftest tests/unit/test_streaming_materialization_live.py -n 0 {args}"
+
+[envs.write-order-tests]
+detached = true
+skip-install = false
+path = ".hatch/write-order-tests"
+dependencies = [
+    "dbt-core>=1.8,<2.0",
+    "dbt-adapters>=1.24.1,<2.0",
+    "pyspark==4.0.3",
+    "pytest>=7.0,<8.0",
+    "pytest-xdist",
+    "pytest-dotenv",
+    "tzlocal>=5,<6",
+]
+
+[envs.write-order-tests.scripts]
+unit-tests = "python -m pytest --noconftest tests/unit/test_write_order.py tests/unit/test_write_order_parse.py -n 0 {args}"
+test = "DBT_RUN_WRITE_ORDER_TESTS=1 python -m pytest --noconftest tests/unit/test_write_order.py tests/unit/test_write_order_parse.py tests/unit/test_write_order_live.py -n 0 {args}"
 
 [envs.build]
 detached = true
