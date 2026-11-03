@@ -133,8 +133,9 @@ else:
     .option("overwriteSchema", "true")
 
   {{ python__partitionedBy_clause() }}
-  {% if location_clause() -%}
-  writer = writer.option("path", "{{ location_clause() | trim }}".split("'")[1])
+  {% set location = location_clause(target_relation) -%}
+  {% if location -%}
+  writer = writer.option("path", "{{ location | trim }}".split("'")[1])
   {%- endif %}
   {{ python__tblproperties_clause() }}
 

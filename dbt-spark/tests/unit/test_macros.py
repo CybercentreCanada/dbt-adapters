@@ -236,6 +236,48 @@ class TestSparkMacros(unittest.TestCase):
         ).strip()
         self.assertEqual(sql, "create table my_table location '/mnt/root/my_table' as select 1")
 
+    def test_python_location_clause_uses_relation_identifier(self):
+        template = self.__get_template("adapters.sql")
+        self.config["location_root"] = "/mnt/root"
+        self.default_context["model"].alias = "orders"
+
+        permanent_location = template.module.spark__location_clause().strip()
+        staging_relation = SparkRelation.create(
+            database="polaris",
+            schema="analytics",
+            identifier="orders__dbt_tmp_batch_1",
+        )
+        staging_location = (
+            template.module.spark__location_clause(staging_relation).strip()
+        )
+        string_relation_location = template.module.spark__location_clause(
+            "polaris.analytics.orders__dbt_tmp"
+        ).strip()
+
+        self.assertEqual(permanent_location, "location '/mnt/root/orders'")
+        self.assertEqual(
+            staging_location, "location '/mnt/root/orders__dbt_tmp_batch_1'"
+        )
+        self.assertEqual(
+            string_relation_location, "location '/mnt/root/orders__dbt_tmp'"
+        )
+
+    def test_python_table_writer_uses_staging_relation_location(self):
+        adapters = self.__get_template("adapters.sql").module
+        self.default_context["location_clause"] = adapters.spark__location_clause
+        self.default_context["partition_cols"] = lambda **kwargs: ""
+        self.config["location_root"] = "/mnt/root"
+        self.default_context["model"].alias = "orders"
+
+        table_template = self.__get_template("materializations/table.sql")
+        staging_relation = SparkRelation.create(
+            database="polaris", schema="analytics", identifier="orders__dbt_tmp"
+        )
+        code = table_template.module.py_write_table("", staging_relation, False)
+
+        self.assertIn("location '/mnt/root/orders__dbt_tmp'", code)
+        self.assertIn("polaris.analytics.orders__dbt_tmp", code)
+
     def test_macros_create_table_as_comment(self):
         template = self.__get_template("adapters.sql")
 

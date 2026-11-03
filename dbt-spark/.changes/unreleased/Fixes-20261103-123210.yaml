@@ -1,0 +1,6 @@
+kind: Fixes
+body: Derive Python incremental staging locations from the resolved staging relation identifier
+time: 2026-11-03T12:32:10-05:00
+custom:
+  Author: cccs-jn
+  Issue: "0"

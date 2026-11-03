@@ -4,7 +4,7 @@ __pycache__/
 *$py.class
 
 dbt-spark-1.11/
-
+**/logs/
 # C extensions
 *.so
 

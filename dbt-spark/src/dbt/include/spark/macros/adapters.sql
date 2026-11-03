@@ -28,17 +28,25 @@
 {%- endmacro -%}
 
 
-{% macro location_clause() %}
-  {{ return(adapter.dispatch('location_clause', 'dbt')()) }}
+{% macro location_clause(relation=none) %}
+  {{ return(adapter.dispatch('location_clause', 'dbt')(relation)) }}
 {%- endmacro -%}
 
-{% macro spark__location_clause() %}
+{% macro spark__location_clause(relation=none) %}
   {%- set location_root = config.get('location_root', validator=validation.any[basestring]) -%}
-  {%- set identifier = model['alias'] -%}
+  {%- set model_identifier = model['alias'] -%}
+  {%- set identifier = model_identifier -%}
+  {%- if relation is not none -%}
+    {%- if relation is string -%}
+      {%- set identifier = relation.split('.')[-1] -%}
+    {%- else -%}
+      {%- set identifier = relation.identifier -%}
+    {%- endif -%}
+  {%- endif -%}
   {%- if location_root is not none %}
     location '{{ location_root }}/{{ identifier }}'
   {%- elif adapter.behavior.require_location_root %}
-    {{ exceptions.raise_compiler_error("location_root is required for model '" ~ identifier ~ "'. Set location_root in your model config or disable the require_location_root flag.") }}
+    {{ exceptions.raise_compiler_error("location_root is required for model '" ~ model_identifier ~ "'. Set location_root in your model config or disable the require_location_root flag.") }}
   {%- endif %}
 {%- endmacro -%}
 
