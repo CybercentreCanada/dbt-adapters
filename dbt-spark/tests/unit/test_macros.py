@@ -237,6 +237,16 @@ class TestSparkMacros(unittest.TestCase):
 
         self.assertIn('target_location = "/mnt/root/my_table"', python)
         self.assertIn('writer = writer.option("location", target_location)', python)
+        staging_relation = SimpleNamespace(identifier="my_table__dbt_tmp")
+        staging = template.module.python__location_clause(staging_relation)
+        self.assertIn('target_location = "/mnt/root/my_table__dbt_tmp"', staging)
+        microbatch_relation = SimpleNamespace(identifier="my_table__dbt_tmp_batch_1")
+        microbatch = template.module.python__location_clause(microbatch_relation)
+        self.assertIn('target_location = "/mnt/root/my_table__dbt_tmp_batch_1"', microbatch)
+        staging_by_name = template.module.python__location_clause(
+            "catalog.schema.my_table__dbt_tmp"
+        )
+        self.assertIn('target_location = "/mnt/root/my_table__dbt_tmp"', staging_by_name)
 
     def __get_python_table_template(self):
         source = (
@@ -266,7 +276,7 @@ class TestSparkMacros(unittest.TestCase):
         )
 
     def test_python_table_partition_functions(self):
-        self.default_context["python__location_clause"] = lambda: ""
+        self.default_context["python__location_clause"] = lambda *_: ""
         transforms = {
             "years": ("created_at",),
             "months": ("created_at",),

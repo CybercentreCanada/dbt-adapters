@@ -143,7 +143,7 @@ of table count, with no per-table `DESCRIBE`. Temporary tables/views are exclude
 including temporary views that share a persistent table's name.
 
 Both `iceberg_listing_fast` and `use_v2_relation_listing` default to `true`.
-To restore the existing v2-first listing with per-table metadata lookup, set
+To use v2-first listing with per-relation metadata lookup, set
 the following in `dbt_project.yml`:
 
 ```yaml
@@ -167,8 +167,10 @@ Remote connections, custom catalog classes, and the mixed-provider
 `SparkSessionCatalog` retain regular listing. Fast-listed relations have empty
 `information` strings; columns are fetched separately when needed. Tables are
 marked Iceberg, while views are not. Missing namespaces return an empty list;
-other listing errors propagate, including lack of `SHOW VIEWS` support. Use the
-opt-out above if the runtime does not support view listing.
+other listing errors propagate, including lack of `SHOW VIEWS` support.
+DESCRIBE-based listing also merges persistent views from `SHOW VIEWS` for
+Iceberg session catalogs, including the v1-to-v2 fallback. These catalogs
+therefore require a runtime supporting view listing with either listing mode.
 
 The focused live test requires a configured Iceberg session with persistent-view
 support. In that environment, run:
@@ -177,6 +179,51 @@ support. In that environment, run:
 DBT_RUN_ICEBERG_LISTING_TESTS=1 hatch run python -m pytest \
   tests/functional/adapter/test_iceberg_listing.py --profile spark_session -n 0
 ```
+
+### Local Spark Iceberg Functional Tests
+
+The opt-in local functional target runs the Iceberg tblproperties, microbatch,
+and relation-listing tests against an in-process Spark 4.1.3 session and
+Iceberg 1.12.0. It uses a dedicated `local_spark_iceberg` profile with an
+Iceberg `SparkCatalog` connected to a local REST catalog, backed by a warehouse under
+`.hatch/local-spark-iceberg/warehouse`; this profile is separate from the
+existing Spark and Databricks profiles. The target does not run the
+Databricks-only Python incremental model location test.
+
+Install Java 17, Hatch, Docker with Compose, and curl. Ensure Maven/Ivy can access
+Maven Central to resolve Iceberg's Spark runtime package on the first run, and
+Docker can pull the catalog image. Then run from
+`dbt-spark/`:
+
+```sh
+mkdir -p .hatch/local-spark-iceberg/warehouse
+export LOCAL_UID="$(id -u)" LOCAL_GID="$(id -g)"
+docker compose -f docker/compose.local-spark-iceberg.yml up -d
+curl --fail --retry 20 --retry-connrefused --retry-delay 1 http://127.0.0.1:8181/v1/config
+hatch run local-spark-iceberg:functional-tests
+docker compose -f docker/compose.local-spark-iceberg.yml down
+```
+
+This command creates a dedicated Hatch environment with the functional test
+dependencies, editable adapter packages, and PySpark 4.1.3, and enables the
+Iceberg listing test's opt-in flag. The independent environment uses a
+self-referencing Hatch template, not detached mode (which disables project
+installation).
+
+The loopback-only REST service uses a pinned Apache reference-server image
+(Iceberg server 1.10.1), with a JDBC backend and persistent-view support. Spark
+still uses `org.apache.iceberg:iceberg-spark-runtime-4.1_2.13:1.12.0`.
+A HadoopCatalog cannot run the persistent-view listing test. Host and container
+mount the warehouse at the same absolute path; run Compose and Hatch from the
+same `dbt-spark` directory on the same host. The catalog database is disposable,
+while warehouse files remain in the dedicated ignored directory.
+
+Only this profile sets model catalog/file-format defaults to Iceberg and
+disables `require_location_root` so catalog-managed locations are tested.
+It explicitly drops test relations before namespace teardown because REST
+catalogs do not implement Spark's cascading namespace deletion. Default
+profiles and CI jobs are unchanged. Run `docker compose ... down` even if pytest
+fails.
 
 ### Iceberg Tblproperties Sync
 

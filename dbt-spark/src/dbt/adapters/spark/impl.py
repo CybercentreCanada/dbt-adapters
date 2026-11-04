@@ -533,20 +533,43 @@ class SparkAdapter(SQLAdapter):
         )
         return relations
 
+    def _list_relations_using_describe(
+        self, kwargs: Dict[str, Any], schema_relation: BaseRelation
+    ) -> List[BaseRelation]:
+        rows = self.execute_macro(LIST_RELATIONS_SHOW_TABLES_MACRO_NAME, kwargs=kwargs)
+        iceberg_catalog = self._catalog_is_iceberg_only(schema_relation.database)
+        if iceberg_catalog:
+            rows = rows.where(lambda row: not row[2])
+        relations = self._build_spark_relation_list(
+            row_list=rows,
+            relation_info_func=self._get_relation_information_using_describe,
+            schema_relation=schema_relation,
+        )
+        if iceberg_catalog:
+            _, views = self.execute(f"show views in {schema_relation} like '*'", fetch=True)
+            view_relations = self._build_spark_relation_list(
+                row_list=views.where(lambda row: not row[2]),
+                relation_info_func=self._get_relation_information_using_describe,
+                schema_relation=schema_relation,
+            )
+            view_relations = [
+                view.incorporate(type=RelationType.View, is_iceberg=False)
+                for view in view_relations
+            ]
+            view_names = {view.identifier for view in view_relations}
+            relations = [
+                relation for relation in relations if relation.identifier not in view_names
+            ]
+            relations.extend(view_relations)
+        return relations
+
     # CCCS v2-first: uses SHOW TABLES + DESCRIBE EXTENDED, falls back to SHOW TABLE EXTENDED
     def _list_relations_v2_first(
         self, kwargs: Dict[str, Any], schema_relation: BaseRelation
     ) -> List[BaseRelation]:
         """SHOW TABLES + DESCRIBE EXTENDED (v2) first, SHOW TABLE EXTENDED (v1) fallback."""
         try:
-            show_table_rows = self.execute_macro(
-                LIST_RELATIONS_SHOW_TABLES_MACRO_NAME, kwargs=kwargs
-            )
-            return self._build_spark_relation_list(
-                row_list=show_table_rows,
-                relation_info_func=self._get_relation_information_using_describe,
-                schema_relation=schema_relation,
-            )
+            return self._list_relations_using_describe(kwargs, schema_relation)
         except DbtRuntimeError as e:
             errmsg = getattr(e, "msg", "")
             if any(msg in errmsg for msg in SCHEMA_NOT_FOUND_MESSAGES) or any(
@@ -597,16 +620,7 @@ class SparkAdapter(SQLAdapter):
                 # this happens with spark-iceberg with v2 iceberg tables
                 # https://issues.apache.org/jira/browse/SPARK-33393
                 try:
-                    # Iceberg behavior: 3-row result of relations obtained
-                    show_table_rows = self.execute_macro(
-                        LIST_RELATIONS_SHOW_TABLES_MACRO_NAME, kwargs=kwargs
-                    )
-                    return self._build_spark_relation_list(
-                        row_list=show_table_rows,
-                        relation_info_func=self._get_relation_information_using_describe,
-                        # CCCS pass BaseRelation to get destination database
-                        schema_relation=schema_relation,
-                    )
+                    return self._list_relations_using_describe(kwargs, schema_relation)
                 except DbtRuntimeError as e:
                     description = "Error while retrieving information about"
                     logger.debug(f"{description} {schema_relation}: {e.msg}")

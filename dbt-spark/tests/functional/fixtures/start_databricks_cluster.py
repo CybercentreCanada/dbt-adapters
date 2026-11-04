@@ -14,7 +14,6 @@ except ImportError:
 from dbt.adapters.spark.connections import SparkConnectionManager
 
 
-HOST = "https://" + getenv("DBT_DATABRICKS_HOST_NAME")
 CLUSTER = getenv("DBT_DATABRICKS_CLUSTER_NAME")
 TOKEN = getenv("DBT_DATABRICKS_TOKEN")
 PORT = 443
@@ -50,8 +49,14 @@ def _wait_for_databricks_cluster() -> None:
 
 
 def _transport_client():
+    host = getenv("DBT_DATABRICKS_HOST_NAME")
+    if not host:
+        raise RuntimeError(
+            "DBT_DATABRICKS_HOST_NAME is required when using a Databricks functional profile"
+        )
+
     conn_url = SparkConnectionManager.SPARK_CONNECTION_URL.format(
-        host=HOST,
+        host=f"https://{host}",
         cluster=CLUSTER,
         port=PORT,
         organization=ORGANIZATION,

@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 import pytest
 
@@ -10,6 +11,7 @@ def dbt_profile_target(request):
         "apache_spark": apache_spark_target,
         "spark_http_odbc": spark_http_odbc_target,
         "spark_session": spark_session_target,
+        "local_spark_iceberg": local_spark_iceberg_target,
         "databricks_cluster": databricks_cluster_target,
         "databricks_http_cluster": databricks_http_cluster_target,
         "databricks_sql_endpoint": databricks_sql_endpoint_target,
@@ -98,6 +100,35 @@ def spark_session_target():
         "type": "spark",
         "host": "localhost",
         "method": "session",
+    }
+
+
+def local_spark_iceberg_target():
+    warehouse = (
+        Path(__file__).resolve().parents[3] / ".hatch" / "local-spark-iceberg" / "warehouse"
+    )
+    return {
+        "type": "spark",
+        "host": "localhost",
+        "method": "session",
+        "server_side_parameters": {
+            "spark.master": "local[2]",
+            "spark.driver.host": "127.0.0.1",
+            "spark.driver.bindAddress": "127.0.0.1",
+            "spark.app.name": "dbt-spark-functional-iceberg",
+            "spark.jars.packages": ("org.apache.iceberg:iceberg-spark-runtime-4.1_2.13:1.12.0"),
+            "spark.sql.extensions": (
+                "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions"
+            ),
+            "spark.sql.catalog.iceberg": "org.apache.iceberg.spark.SparkCatalog",
+            "spark.sql.catalog.iceberg.type": "rest",
+            "spark.sql.catalog.iceberg.uri": "http://127.0.0.1:8181",
+            "spark.sql.catalog.iceberg.rest.auth.type": "none",
+            "spark.sql.catalog.iceberg.warehouse": warehouse.as_uri(),
+            "spark.sql.defaultCatalog": "iceberg",
+            "spark.sql.session.timeZone": "UTC",
+            "spark.sql.sources.partitionOverwriteMode": "dynamic",
+        },
     }
 
 

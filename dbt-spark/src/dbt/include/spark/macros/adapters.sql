@@ -48,9 +48,19 @@
   {%- endif %}
 {%- endmacro -%}
 
-{% macro python__location_clause() %}
+{% macro python__location_clause(target_relation=none) %}
   {%- set location_root = config.get('location_root', validator=validation.any[basestring]) -%}
   {%- set identifier = model['alias'] -%}
+  {%- if target_relation is not none -%}
+    {%- if target_relation is string -%}
+      {%- set target_identifier = target_relation.split('.')[-1] -%}
+    {%- else -%}
+      {%- set target_identifier = target_relation.identifier -%}
+    {%- endif -%}
+    {%- if target_identifier.startswith(identifier ~ '__dbt_tmp') -%}
+      {%- set identifier = target_identifier -%}
+    {%- endif -%}
+  {%- endif -%}
   {%- if location_root is not none -%}
 target_location = {{ (location_root ~ '/' ~ identifier) | tojson }}
 writer = writer.option("location", target_location)

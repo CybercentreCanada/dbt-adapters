@@ -48,6 +48,30 @@ dependencies = [
 [envs.local-spark-tests.scripts]
 test = "DBT_RUN_LOCAL_SPARK_TESTS=1 python -m pytest --noconftest tests/unit/test_streaming_materialization_live.py -n 0 {args}"
 
+[envs.local-spark-iceberg]
+template = "local-spark-iceberg"
+skip-install = false
+pre-install-commands = [
+    "pip install dbt-core@git+https://github.com/dbt-labs/dbt-core.git@1.latest#subdirectory=core",
+    "pip install -e ../dbt-adapters",
+    "pip install -e ../dbt-tests-adapter",
+]
+dependencies = [
+    "ddtrace==2.3.0",
+    "freezegun",
+    "pytest>=7.0,<8.0",
+    "pytest-csv~=3.0",
+    "pytest-dotenv",
+    "pytest-mock",
+    "pytest-xdist",
+    "tenacity",
+    "pyspark==4.1.3",
+]
+features = ["session"]
+
+[envs.local-spark-iceberg.scripts]
+functional-tests = "DBT_RUN_ICEBERG_LISTING_TESTS=1 python -m pytest tests/functional/adapter/tblproperties/test_iceberg_tblproperties.py tests/functional/adapter/incremental_strategies/test_microbatch.py tests/functional/adapter/test_iceberg_listing.py --profile local_spark_iceberg -n 0 {args}"
+
 [envs.write-order-tests]
 detached = true
 skip-install = false

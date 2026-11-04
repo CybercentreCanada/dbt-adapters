@@ -170,7 +170,7 @@ def _dbt_writer(name, frame, owner=None):
     for key, value in _dbt_properties.items():
         writer = writer.tableProperty(str(key), str(value))
     if name == _dbt_target:
-{{ python__location_clause() | trim | indent(8, true) }}
+{{ python__location_clause(target_relation) | trim | indent(8, true) }}
         pass
     if owner is not None:
         writer = writer.tableProperty("dbt.write-order-owner", owner)
@@ -204,7 +204,7 @@ else:
     .option("overwriteSchema", "true")
 
   {{ python__partitionedBy_clause() }}
-{{ python__location_clause() | trim | indent(2, true) }}
+{{ python__location_clause(target_relation) | trim | indent(2, true) }}
   {{ python__tblproperties_clause() }}
 
   writer.create()

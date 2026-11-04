@@ -71,7 +71,8 @@ def _microbatch_docs_model_sql(prop_value: str) -> str:
         "event_time='event_time', batch_size='day', "
         "begin=modules.datetime.datetime(2020, 1, 1, 0, 0, 0), partition_by=['date_day'], "
         "file_format='iceberg', concurrent_batches=true, "
-        f"tblproperties={{'dbt.test.prop': '{prop_value}'}}) }}}}\n"
+        f"tblproperties={{'dbt.test.prop': '{prop_value}', "
+        "'write.parquet.compression-codec': 'zstd'}) }}\n"
         "select id, event_time, cast(event_time as date) as date_day\n"
         "from {{ ref('input_model') }}\n"
     )
@@ -132,7 +133,8 @@ class TestMicrobatchConcurrentMetadataSync:
         )
         log_output = self._run()
         assert log_output.count("Updating table comment on") == 1
-        assert log_output.count("Tblproperties drift on") == 1
+        assert log_output.count(": setting dbt.test.prop") == 1
+        assert log_output.count(": unsetting ") <= 1
 
         described = self._describe(project)
         assert described["Comment"][1] == "table v2"

@@ -10,7 +10,7 @@ They validate that:
 
 import pytest
 
-from dbt.tests.util import run_dbt, relation_from_name
+from dbt.tests.util import run_dbt, relation_from_name, write_file
 
 
 _MODEL_CREATE = """
@@ -86,7 +86,8 @@ select 1 as id
 def _get_tblproperties(project, model_name):
     """Fetch tblproperties from the catalog for a given model."""
     relation = relation_from_name(project.adapter, model_name)
-    _, result = project.adapter.execute(f"SHOW TBLPROPERTIES {relation}", fetch=True)
+    with project.adapter.connection_named("tblproperties"):
+        _, result = project.adapter.execute(f"SHOW TBLPROPERTIES {relation}", fetch=True)
     props = {}
     for row in result.rows:
         props[str(row[0])] = str(row[1])
@@ -140,7 +141,7 @@ class TestIcebergTblpropertiesAddProperty:
         run_dbt(["run"])
 
         # Second run: add a property
-        project.models = {"my_model.sql": _MODEL_ADD_PROPERTY}
+        write_file(_MODEL_ADD_PROPERTY, project.project_root, "models", "my_model.sql")
         run_dbt(["run"])
 
         props = _get_tblproperties(project, "my_model")
@@ -158,7 +159,7 @@ class TestIcebergTblpropertiesRemoveProperty:
         run_dbt(["run"])
 
         # Second run: remove one property
-        project.models = {"my_model.sql": _MODEL_REMOVE_PROPERTY}
+        write_file(_MODEL_REMOVE_PROPERTY, project.project_root, "models", "my_model.sql")
         run_dbt(["run"])
 
         props = _get_tblproperties(project, "my_model")
@@ -176,7 +177,7 @@ class TestIcebergTblpropertiesUpdateProperty:
         run_dbt(["run"])
 
         # Second run: change value
-        project.models = {"my_model.sql": _MODEL_UPDATE_PROPERTY}
+        write_file(_MODEL_UPDATE_PROPERTY, project.project_root, "models", "my_model.sql")
         run_dbt(["run"])
 
         props = _get_tblproperties(project, "my_model")
