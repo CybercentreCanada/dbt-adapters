@@ -182,3 +182,22 @@ class TestIcebergTblpropertiesUpdateProperty:
 
         props = _get_tblproperties(project, "my_model")
         assert props.get("write.format.default") == "avro"
+
+
+class TestIcebergTblpropertiesPreservePolaris:
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {"my_model.sql": _MODEL_CREATE}
+
+    def test_incremental_sync_preserves_catalog_managed_properties(self, project):
+        assert len(run_dbt(["run"])) == 1
+        relation = relation_from_name(project.adapter, "my_model")
+        project.run_sql(
+            f"alter table {relation} set tblproperties ('polaris_test_property' = 'managed')"
+        )
+        write_file(_MODEL_REMOVE_PROPERTY, project.project_root, "models", "my_model.sql")
+        assert len(run_dbt(["run"])) == 1
+        props = _get_tblproperties(project, "my_model")
+        assert props["polaris_test_property"] == "managed"
+        assert props["write.format.default"] == "parquet"
+        assert "history.expire.max-snapshot-age-ms" not in props

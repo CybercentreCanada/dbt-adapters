@@ -14,6 +14,12 @@ pytest_plugins = ["dbt.tests.fixtures.project"]
 
 
 @pytest.fixture(scope="class")
+def local_session_profile(request):
+    if request.config.getoption("--profile") != "local_spark_iceberg":
+        pytest.skip("Requires the local Spark Iceberg session profile")
+
+
+@pytest.fixture(scope="class")
 def dbt_project_yml(dbt_project_yml, request, project_root):
     if request.config.getoption("--profile") == "local_spark_iceberg":
         models = dbt_project_yml.setdefault("models", {})

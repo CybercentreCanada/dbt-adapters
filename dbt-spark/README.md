@@ -182,9 +182,33 @@ DBT_RUN_ICEBERG_LISTING_TESTS=1 hatch run python -m pytest \
 
 ### Local Spark Iceberg Functional Tests
 
+Run all local test stages with the [local test runner](scripts/run_local_tests.sh):
+
+```sh
+bash scripts/run_local_tests.sh -q
+```
+
+The runner works from any directory, defaults `SPARK_LOCAL_IP` to loopback,
+starts the Compose catalog, waits for REST readiness, and stops it on exit
+(including failures and interrupts). It refuses existing Compose containers or
+an already-responsive catalog so it cannot take over another test session.
+Docker daemon access and the prerequisites below are required.
+
+It runs `local-spark-iceberg:adapter-tests`, `local-spark-iceberg:functional-tests`,
+`local-spark-iceberg:unit-tests`, and `local-spark-tests:test` sequentially.
+Adapter tests are intentionally repeated within the full functional stage.
+Pytest arguments are forwarded to every stage; each stage reports pass/fail,
+remaining stages still run after test failures, and any test or cleanup failure
+produces a nonzero exit code. Warehouse files are retained.
+
+The local unit target selects column, comment, partition, property, local-profile,
+and runner tests without loading transport fixtures. It does **not** replace the
+full `hatch run unit-tests` suite or write-order certification.
+
 The opt-in local functional target runs the Iceberg tblproperties, microbatch,
-relation-listing, and Python incremental staging-location tests against an in-process Spark 4.1.3 session and
-Iceberg 1.12.0. It uses a dedicated `local_spark_iceberg` profile with an
+relation-listing, Python incremental staging-location, adapter, persisted-comment,
+partition-drift, and SQL contract tests against an in-process Spark 4.1.3 session
+and Iceberg 1.12.0. It uses a dedicated `local_spark_iceberg` profile with an
 Iceberg `SparkCatalog` connected to a local REST catalog, backed by a warehouse under
 `.hatch/local-spark-iceberg/warehouse`; this profile is separate from the
 existing Spark and Databricks profiles. The target does not run the
@@ -235,6 +259,37 @@ uses `spark_session_based_cluster` to verify temporary-view staging remains
 unchanged (the view remains session-scoped until test teardown). Unique test
 storage roots are cleaned after their relations. These tests do not certify
 Databricks transport, custom staging hooks, or physical microbatch execution.
+
+To run only the live adapter tests with `type: spark` and `method: session`,
+start the REST catalog as above, then run:
+
+```sh
+SPARK_LOCAL_IP=127.0.0.1 hatch run local-spark-iceberg:adapter-tests
+```
+
+These tests exercise actual session connections and configured settings, query
+results and error propagation/recovery, column metadata, and persistent
+table/view listing with temporary relations excluded, plus the portable feature
+coverage below. They are also included in `local-spark-iceberg:functional-tests`.
+They do not mock Spark or require HTTP/Thrift/ODBC adapter credentials. The
+original unit tests remain unchanged; these live counterparts are integration
+tests, not unit tests.
+
+| Existing coverage | Local session counterpart |
+| --- | --- |
+| Column comment and metadata-sync units | [Persisted comments](tests/functional/adapter/test_metadata_session.py): create, update, clear, case-insensitive column matching, escaped descriptions, and unchanged-doc diffs on real metadata |
+| Partition-sync units | [Partition policies](tests/functional/adapter/test_metadata_session.py): plain/transform partitions, warning/error/disabled modes, unchanged partition specs, and writes blocked on errors |
+| Tblproperties units | [Property sync](tests/functional/adapter/tblproperties/test_iceberg_tblproperties.py): create, project override, add/update/remove, and preservation of `polaris_` catalog-managed properties |
+| Non-session SQL constraints tests and column types | [SQL contracts](tests/functional/adapter/test_constraints_session.py): table/incremental/view schema validation, seven Spark data types, table column ordering, exact row values, and rejected name/type mismatches without publishing a relation |
+
+SQL schema contracts are not row-level constraint enforcement. The local target
+does not add Delta or certify its CHECK/NOT NULL enforcement tests. Python model
+contracts remain excluded because dbt-core rejects them; see the
+[Python contracts ADR](docs/arch/adr-0002-spark-python-model-contracts.md).
+Transport polling/retry tests, credential validation, telemetry, and pure
+Python parsing tests remain in the unit suite. Streaming/batch writer tests
+remain in `local-spark-tests:test`; write-order certification retains its
+separate Spark 4.0 environment.
 
 Iceberg Python writes pass the configured location as a DataFrameWriterV2
 table property; Iceberg ignores the corresponding writer option. This applies
