@@ -2,7 +2,7 @@
 title: dbt-spark Python Incremental Staging Locations
 version: "1.0"
 date_created: 2026-11-03
-last_updated: 2026-11-03
+last_updated: 2026-11-04
 tags: [design, dbt-spark, spark, python, incremental, iceberg]
 ---
 
@@ -177,6 +177,12 @@ staging_location = "dbfs:/warehouse/models/orders__dbt_tmp_batch_1"
     supported Spark/Databricks profile.
 - **Frameworks**: Use the dbt-spark unit and functional test suites and existing
   dbt test fixtures. Do not introduce a separate test framework.
+- **Local integration coverage**: The `local_spark_iceberg` profile runs default
+  physical staging and temporary-view compatibility through `dbt run`, using a
+  test-only local submission helper for the physical case. It checks actual
+  catalog locations, merged rows, and physical staging cleanup. It does not
+  certify remote Databricks submission, custom staging hooks, or physical
+  microbatch execution.
 - **Test data management**: Use a unique temporary storage root for functional
   tests. Tests must not use production storage locations or credentials.
 - **CI/CD integration**: Run unit tests in the existing dbt-spark unit-test job.
@@ -205,6 +211,15 @@ session-scoped temporary views.
 The fix is general adapter behavior. Deployment may begin in development
 environments before broader rollout; the adapter code itself is not environment
 gated.
+
+Live local integration testing also exposed a prerequisite: Iceberg ignores
+DataFrameWriterV2's `option("location", ...)`. Python Iceberg writers must use
+`tableProperty("location", ...)` to honor this specification's paths. The
+alias-based permanent path contract is unchanged, but newly created Iceberg
+Python tables now actually use the configured path rather than silently using
+the catalog default. This also applies to the shared writer used for streaming
+table initialization. Existing tables are not relocated, and non-Iceberg
+location options are unchanged.
 
 ## 8. Dependencies & External Integrations
 
@@ -303,3 +318,4 @@ A change conforms to this specification only when all of the following hold:
 - [Spark Python table writer and location macros](../src/dbt/include/spark/macros/materializations/table.sql)
 - [Spark adapter location macros](../src/dbt/include/spark/macros/adapters.sql)
 - [Spark Python model functional tests](../tests/functional/adapter/test_python_model.py)
+- [Local Python staging integration tests](../tests/functional/adapter/test_python_incremental_staging_location.py)

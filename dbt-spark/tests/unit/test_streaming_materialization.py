@@ -121,7 +121,7 @@ def _render_stream_table(
             ),
             "python__location_clause": lambda: (
                 'target_location = "' + location_root + '/stream"\n'
-                'writer = writer.option("location", target_location)'
+                'writer = writer.tableProperty("location", target_location)'
                 if location_root
                 else ""
             ),
@@ -194,13 +194,13 @@ def test_streaming_materialization_preserves_runtime_dataframe_name(macro_name, 
 
 
 @pytest.mark.parametrize("macro_name", ["py_stream_table", "sql_stream_table"])
-def test_streaming_materialization_uses_python_location_option(macro_name):
+def test_streaming_materialization_uses_python_location_property(macro_name):
     rendered = _render_stream_table(macro_name, location_root="/mnt/root")
 
     compile(rendered, f"{macro_name}.py", "exec")
 
     assert 'target_location = "/mnt/root/stream"' in rendered
-    assert 'writer = writer.option("location", target_location)' in rendered
+    assert 'writer = writer.tableProperty("location", target_location)' in rendered
     assert 'writer = writer.option("path",' not in rendered
     assert '.split("\'")' not in rendered
 

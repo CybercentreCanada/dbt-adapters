@@ -183,7 +183,7 @@ DBT_RUN_ICEBERG_LISTING_TESTS=1 hatch run python -m pytest \
 ### Local Spark Iceberg Functional Tests
 
 The opt-in local functional target runs the Iceberg tblproperties, microbatch,
-and relation-listing tests against an in-process Spark 4.1.3 session and
+relation-listing, and Python incremental staging-location tests against an in-process Spark 4.1.3 session and
 Iceberg 1.12.0. It uses a dedicated `local_spark_iceberg` profile with an
 Iceberg `SparkCatalog` connected to a local REST catalog, backed by a warehouse under
 `.hatch/local-spark-iceberg/warehouse`; this profile is separate from the
@@ -224,6 +224,24 @@ It explicitly drops test relations before namespace teardown because REST
 catalogs do not implement Spark's cascading namespace deletion. Default
 profiles and CI jobs are unchanged. Run `docker compose ... down` even if pytest
 fails.
+
+The Python staging tests run a model twice through dbt with merge, checking
+exact updated/inserted rows and catalog-reported storage locations. A scoped,
+test-only submission helper executes the real generated Python locally under a
+distinct helper name to exercise physical staging. It verifies
+`location_root/orders__dbt_tmp` differs from the permanent
+`location_root/orders` and that the staging table is removed. A second case
+uses `spark_session_based_cluster` to verify temporary-view staging remains
+unchanged (the view remains session-scoped until test teardown). Unique test
+storage roots are cleaned after their relations. These tests do not certify
+Databricks transport, custom staging hooks, or physical microbatch execution.
+
+Iceberg Python writes pass the configured location as a DataFrameWriterV2
+table property; Iceberg ignores the corresponding writer option. This applies
+to permanent/staging tables and empty tables initialized for streaming.
+New Iceberg Python tables with `location_root` now honor that path instead of
+silently using a catalog-managed location. Existing tables are not relocated,
+and non-Iceberg writers retain the location option.
 
 ### Iceberg Tblproperties Sync
 

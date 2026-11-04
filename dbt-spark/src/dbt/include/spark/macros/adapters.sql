@@ -63,7 +63,11 @@
   {%- endif -%}
   {%- if location_root is not none -%}
 target_location = {{ (location_root ~ '/' ~ identifier) | tojson }}
+  {%- if (config.get('file_format') or 'iceberg') == 'iceberg' %}
+writer = writer.tableProperty("location", target_location)
+  {%- else %}
 writer = writer.option("location", target_location)
+  {%- endif %}
   {%- elif adapter.behavior.require_location_root %}
     {{ exceptions.raise_compiler_error("location_root is required for model '" ~ identifier ~ "'. Set location_root in your model config or disable the require_location_root flag.") }}
   {%- endif %}

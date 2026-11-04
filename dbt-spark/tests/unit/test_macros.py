@@ -236,7 +236,7 @@ class TestSparkMacros(unittest.TestCase):
         python = template.module.python__location_clause()
 
         self.assertIn('target_location = "/mnt/root/my_table"', python)
-        self.assertIn('writer = writer.option("location", target_location)', python)
+        self.assertIn('writer = writer.tableProperty("location", target_location)', python)
         staging_relation = SimpleNamespace(identifier="my_table__dbt_tmp")
         staging = template.module.python__location_clause(staging_relation)
         self.assertIn('target_location = "/mnt/root/my_table__dbt_tmp"', staging)
@@ -247,6 +247,21 @@ class TestSparkMacros(unittest.TestCase):
             "catalog.schema.my_table__dbt_tmp"
         )
         self.assertIn('target_location = "/mnt/root/my_table__dbt_tmp"', staging_by_name)
+
+    def test_python_location_clause_preserves_non_iceberg_option(self):
+        self.config["location_root"] = "/mnt/root"
+        self.default_context["model"].alias = "my_table"
+        template = self.__get_template("adapters.sql")
+        for file_format in ("delta", "parquet", "hudi"):
+            self.config["file_format"] = file_format
+            python = template.module.python__location_clause()
+            self.assertIn('writer = writer.option("location", target_location)', python)
+            self.assertNotIn('writer.tableProperty("location"', python)
+        self.config["file_format"] = "iceberg"
+        python = template.module.python__location_clause()
+        self.assertIn('writer = writer.tableProperty("location", target_location)', python)
+        self.config["location_root"] = None
+        self.assertEqual(template.module.python__location_clause().strip(), "")
 
     def __get_python_table_template(self):
         source = (

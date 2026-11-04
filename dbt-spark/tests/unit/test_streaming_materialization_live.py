@@ -21,7 +21,7 @@ pytestmark = pytest.mark.skipif(
 STREAMING_TEMPLATE = (
     Path(__file__).parents[2] / "src/dbt/include/spark/macros/materializations/streaming.sql"
 )
-ICEBERG_PACKAGE = "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.5.0"
+ICEBERG_PACKAGE = "org.apache.iceberg:iceberg-spark-runtime-4.1_2.13:1.12.0"
 
 
 class _Config:
@@ -281,7 +281,7 @@ def test_python_batch_materialization_creates_partitioned_table(spark, partition
             "config": _Config({"partition_by": partitions}),
             "validation": type("Validation", (), {"any": {(list, str): None}})(),
             "basestring": str,
-            "python__location_clause": lambda: "",
+            "python__location_clause": lambda target_relation=None: "",
             "spark__filtered_tblproperties": lambda props: props,
         }
     )
