@@ -1,0 +1,5 @@
+kind: Fixes
+body: Include persistent Iceberg views in DESCRIBE-based session catalog relation listing.
+time: 2026-11-03T13:56:09.283063941-05:00
+custom:
+    Author: cccs-jn

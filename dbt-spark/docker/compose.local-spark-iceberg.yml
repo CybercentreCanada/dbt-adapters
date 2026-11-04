@@ -1,0 +1,18 @@
+name: dbt-spark-local-iceberg
+
+services:
+  catalog:
+    image: bagofholding.cse-cst.gc.ca:18443/apache/iceberg-rest-fixture:1.10.1@sha256:f7d679d30ac9c640bdeb2c015dff533cd3c8f1c7d491ebcb5d436f9a42db1d6f
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    ports:
+      - "127.0.0.1:8181:8181"
+    environment:
+      CATALOG_CATALOG__IMPL: org.apache.iceberg.jdbc.JdbcCatalog
+      CATALOG_URI: jdbc:sqlite:file:/tmp/iceberg-local.db
+      CATALOG_JDBC_SCHEMA__VERSION: V1
+      CATALOG_WAREHOUSE: "file://${PWD}/.hatch/local-spark-iceberg/warehouse"
+      CATALOG_IO__IMPL: org.apache.iceberg.hadoop.HadoopFileIO
+    volumes:
+      - type: bind
+        source: "${PWD}/.hatch/local-spark-iceberg/warehouse"
+        target: "${PWD}/.hatch/local-spark-iceberg/warehouse"
