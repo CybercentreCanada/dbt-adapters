@@ -172,6 +172,13 @@ DESCRIBE-based listing also merges persistent views from `SHOW VIEWS` for
 Iceberg session catalogs, including the v1-to-v2 fallback. These catalogs
 therefore require a runtime supporting view listing with either listing mode.
 
+Regular listing renders DESCRIBE targets with relation include/quote policies.
+An individual table or view that disappears during discovery is skipped without
+discarding the surviving relations. Permission and runtime errors propagate;
+only unsupported listing operations trigger the legacy listing fallback.
+Catalog column entries preserve the relation's catalog identity and occur once
+per discovered column, including tables and views returned by fast listing.
+
 The focused live test requires a configured Iceberg session with persistent-view
 support. In that environment, run:
 
@@ -202,8 +209,8 @@ remaining stages still run after test failures, and any test or cleanup failure
 produces a nonzero exit code. Warehouse files are retained.
 
 The local unit target selects column, comment, partition, property, local-profile,
-and runner tests without loading transport fixtures. It does **not** replace the
-full `hatch run unit-tests` suite or write-order certification.
+session correctness, and runner tests without loading transport fixtures. It does
+**not** replace the full `hatch run unit-tests` suite or write-order certification.
 
 The opt-in local functional target runs the Iceberg tblproperties, microbatch,
 relation-listing, Python incremental staging-location, adapter, persisted-comment,
@@ -272,8 +279,8 @@ results and error propagation/recovery, column metadata, and persistent
 table/view listing with temporary relations excluded, plus the portable feature
 coverage below. They are also included in `local-spark-iceberg:functional-tests`.
 They do not mock Spark or require HTTP/Thrift/ODBC adapter credentials. The
-original unit tests remain unchanged; these live counterparts are integration
-tests, not unit tests.
+live counterparts complement the unit suite; they are integration tests, not
+unit tests.
 
 | Existing coverage | Local session counterpart |
 | --- | --- |
@@ -290,6 +297,29 @@ Transport polling/retry tests, credential validation, telemetry, and pure
 Python parsing tests remain in the unit suite. Streaming/batch writer tests
 remain in `local-spark-tests:test`; write-order certification retains its
 separate Spark 4.0 environment.
+
+### Session cursor and partition correctness
+
+Session cursors discard the previous result before each execution attempt,
+including failed attempts. `fetchone()` and `fetchall()` consume the same
+ordered result stream; exhausted results return `None` and `[]`, respectively.
+Rows are read using Spark's local iterator instead of collecting the entire
+result for `fetchone()`. Closing a cursor releases its result references, not
+the shared Spark session. Cursor context managers propagate body exceptions.
+
+When `check_partition_sync` is enabled for Iceberg, configured and discovered
+partition expressions share quote-aware normalization. Quoting regular column
+names or changing insignificant transform whitespace does not cause drift;
+quoted punctuation, escaped backticks, transform arguments, and partition order
+remain significant. Session checks use the active `spark.sql.caseSensitive`
+setting. Invalid configuration or unparseable/empty SHOW CREATE TABLE metadata
+raises an error even in drift-warning mode. Valid unpartitioned DDL still matches
+omitted partition configuration. Genuine drift retains the existing
+`check_partition_sync_raises` warning/error policy.
+
+These fixes cover session cursor, relation/catalog metadata, and partition
+comparison only. They do not address or certify Databricks command helpers,
+non-session query replay/retries, or PySpark-free non-session imports.
 
 Iceberg Python writes pass the configured location as a DataFrameWriterV2
 table property; Iceberg ignores the corresponding writer option. This applies

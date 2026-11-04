@@ -296,22 +296,13 @@ def test_fast_listing_metadata_is_fetched_when_requested(listing_adapter, relati
     ):
         relation = listing_adapter._list_relations_fast(schema)[0]
     column = SparkColumn(column="id", dtype="int")
-    if relation.is_iceberg:
-        with (
-            mock.patch(
-                "dbt.adapters.sql.SQLAdapter.get_columns_in_relation", return_value=[]
-            ) as raw,
-            mock.patch.object(listing_adapter, "parse_describe_extended", return_value=[column]),
-        ):
-            metadata = list(listing_adapter._get_columns_for_catalog(relation))
-        raw.assert_called_once_with(relation)
-    else:
-        with mock.patch.object(
-            listing_adapter, "get_columns_in_relation", return_value=[column]
-        ) as describe:
-            metadata = list(listing_adapter._get_columns_for_catalog(relation))
-        describe.assert_called_once_with(relation)
-    assert metadata
+    with mock.patch.object(
+        listing_adapter, "get_columns_in_relation", return_value=[column]
+    ) as describe:
+        metadata = list(listing_adapter._get_columns_for_catalog(relation))
+    describe.assert_called_once_with(relation)
+    assert len(metadata) == 1
+    assert metadata[0]["table_database"] == "polaris"
     assert all(row["column_name"] == "id" and row["column_type"] == "int" for row in metadata)
 
 
@@ -1254,8 +1245,8 @@ class TestGetColumnsForCatalogIcebergFallback(unittest.TestCase):
         self.assertEqual(result[0]["column_name"], "id")
         self.assertEqual(result[1]["column_name"], "name")
 
-    def test_fallback_swallows_runtime_error(self):
-        """If the fallback get_columns_in_relation raises DbtRuntimeError"""
+    def test_fallback_propagates_runtime_error(self):
+        """A failed DESCRIBE must not appear to be a successful empty catalog."""
         adapter = self._make_adapter()
 
         relation = SparkRelation.create(
@@ -1270,6 +1261,5 @@ class TestGetColumnsForCatalogIcebergFallback(unittest.TestCase):
             "get_columns_in_relation",
             side_effect=DbtRuntimeError("describe failed"),
         ):
-            result = list(adapter._get_columns_for_catalog(relation))
-
-        self.assertEqual(result, [])
+            with self.assertRaisesRegex(DbtRuntimeError, "describe failed"):
+                list(adapter._get_columns_for_catalog(relation))

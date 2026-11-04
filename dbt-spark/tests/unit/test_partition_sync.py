@@ -1,7 +1,9 @@
 """Unit tests for partition drift detection logic."""
 
+import agate
 import pytest
 
+from dbt_common.exceptions import DbtRuntimeError
 from dbt.adapters.spark.relation_configs.partitions import (
     PartitionConfig,
     PartitionProcessor,
@@ -82,7 +84,7 @@ class TestParsePartitionSpec:
         PARTITIONED BY (`my column`)
         TBLPROPERTIES ('format-version' = '2')
         """
-        assert _parse_partition_spec(ddl) == ["my column"]
+        assert _parse_partition_spec(ddl) == ["`my column`"]
 
     def test_case_insensitive(self):
         ddl = """
@@ -171,28 +173,17 @@ class TestPartitionProcessor:
         assert config.partition_columns == ["region", "days(ts)"]
 
     def test_from_show_create_table_none(self):
-        config = PartitionProcessor.from_show_create_table(None)
-        assert config.partition_columns == []
+        with pytest.raises(DbtRuntimeError, match="partition metadata"):
+            PartitionProcessor.from_show_create_table(None)
 
     def test_from_show_create_table_parses_ddl(self):
-        class FakeRow:
-            def __init__(self, val):
-                self._val = val
-
-            def __getitem__(self, idx):
-                return self._val
-
-        class FakeTable:
-            def __init__(self, ddl):
-                self.rows = [FakeRow(ddl)]
-
         ddl = (
             "CREATE TABLE cat.schema.tbl (id BIGINT, ts TIMESTAMP) "
             "USING iceberg "
             "PARTITIONED BY (days(ts), bucket(16, id)) "
             "TBLPROPERTIES ('format-version' = '2')"
         )
-        config = PartitionProcessor.from_show_create_table(FakeTable(ddl))
+        config = PartitionProcessor.from_show_create_table(agate.Table([(ddl,)], ["ddl"]))
         assert config.partition_columns == ["days(ts)", "bucket(16, id)"]
 
     def test_is_out_of_sync_true(self):
@@ -211,3 +202,113 @@ class TestPartitionProcessor:
         diff = PartitionProcessor.describe_diff(desired, existing)
         assert "['dt', 'region']" in diff
         assert "['dt']" in diff
+
+
+@pytest.mark.parametrize(
+    "configured,actual",
+    [
+        ("`id`", "id"),
+        ("bucket(16,   `id`)", "bucket(16,id)"),
+        ("truncate(4, `region`)", "truncate(4,region)"),
+        ("days( `Event_Time` )", "days(event_time)"),
+        ("`a,b`", "`a,b`"),
+        ("`a.b`", "`a.b`"),
+        ("`a``b`", "`a``b`"),
+        ("`two  spaces`", "`two  spaces`"),
+    ],
+)
+def test_model_and_database_share_partition_normalization(configured, actual):
+    assert _normalize_model_partitions(configured) == _parse_partition_spec(
+        f"CREATE TABLE t USING iceberg PARTITIONED BY ({actual})"
+    )
+
+
+@pytest.mark.parametrize(
+    "configured,actual",
+    [
+        ("`a,b`", "a, b"),
+        ("`a.b`", "a.b"),
+        ("`two  spaces`", "`two spaces`"),
+        ("bucket(16,id)", "bucket(32,id)"),
+        ("truncate(4,region)", "truncate(8,region)"),
+    ],
+)
+def test_partition_normalization_preserves_real_differences(configured, actual):
+    assert _normalize_model_partitions(configured) != _parse_partition_spec(
+        f"CREATE TABLE t USING iceberg PARTITIONED BY ({actual})"
+    )
+
+
+def test_partition_identifiers_follow_case_sensitive_resolution():
+    assert _normalize_model_partitions("`ID`", case_sensitive=True) == ["ID"]
+    assert _normalize_model_partitions("ID", case_sensitive=True) != _parse_partition_spec(
+        "CREATE TABLE t USING iceberg PARTITIONED BY (`id`)", case_sensitive=True
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        42,
+        {},
+        [None],
+        [1],
+        [""],
+        " ",
+        "id, other",
+        "bucket(, id)",
+        "bucket(0, id)",
+        "bucket('16', id)",
+        "truncate(-1, region)",
+        "unknown(id)",
+        "days()",
+        "id STRING",
+        "`unterminated",
+        "id) TBLPROPERTIES ('x' = 'y') --",
+    ],
+)
+def test_invalid_partition_config_raises(value):
+    with pytest.raises(DbtRuntimeError, match="partition"):
+        _normalize_model_partitions(value)
+
+
+@pytest.mark.parametrize(
+    "ddl",
+    [
+        "",
+        "garbage",
+        "CREATE TABLE t USING iceberg PARTITIONED BY (",
+        "CREATE TABLE t USING iceberg PARTITIONED BY ()",
+        "CREATE TABLE t USING iceberg PARTITIONED BY (id,)",
+        "CREATE TABLE t USING iceberg PARTITIONED BY (`unterminated)",
+        "CREATE TABLE t USING iceberg PARTITIONED BY (bucket(0, id))",
+    ],
+)
+def test_invalid_partition_metadata_raises(ddl):
+    with pytest.raises(DbtRuntimeError, match="partition"):
+        _parse_partition_spec(ddl)
+
+
+def test_partition_clause_text_inside_comment_is_not_a_partition():
+    assert (
+        _parse_partition_spec(
+            "CREATE TABLE t (id BIGINT) USING iceberg COMMENT 'PARTITIONED BY (bad)'"
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize(
+    "rows,columns",
+    [
+        ([], ["ddl"]),
+        ([(None,)], ["ddl"]),
+        ([("",)], ["ddl"]),
+        ([()], []),
+        ([("one", "two")], ["a", "b"]),
+        ([("one",), ("two",)], ["ddl"]),
+    ],
+)
+def test_invalid_show_create_result_shape_is_an_explicit_error(rows, columns):
+    with pytest.raises(DbtRuntimeError, match="partition metadata"):
+        PartitionProcessor.from_show_create_table(agate.Table(rows, columns))

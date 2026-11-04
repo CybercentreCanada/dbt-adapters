@@ -3,6 +3,7 @@ from uuid import uuid4
 import pytest
 
 from dbt.adapters.spark.connections import SparkConnectionMethod
+from dbt.adapters.spark.session import Cursor
 from dbt_common.exceptions import DbtRuntimeError
 from dbt.tests.util import run_dbt
 
@@ -57,6 +58,32 @@ select * from {{ ref('orders') }}
         assert result.column_names == ("id", "label")
         assert [tuple(row) for row in result.rows] == [(1, "first"), (2, "second")]
 
+    def test_cursor_reuse_mixed_fetches_and_failure_state(self, session_project):
+        cursor = Cursor(
+            server_side_parameters=session_project.adapter.config.credentials.server_side_parameters
+        )
+        try:
+            cursor.execute("select id from range(3) order by id")
+            assert tuple(cursor.fetchone()) == (0,)
+            assert [tuple(row) for row in cursor.fetchall()] == [(1,), (2,)]
+            assert cursor.fetchone() is None
+            assert cursor.fetchall() == []
+            cursor.execute("select 42 as answer")
+            assert [tuple(row) for row in cursor.fetchall()] == [(42,)]
+            with pytest.raises(DbtRuntimeError, match="TABLE_OR_VIEW_NOT_FOUND"):
+                cursor.execute(f"select * from missing_{uuid4().hex}")
+            assert cursor.description == []
+            assert cursor.fetchone() is None
+            assert cursor.fetchall() is None
+            with pytest.raises(ValueError, match="context body failed"):
+                with cursor:
+                    cursor.execute("select 7")
+                    raise ValueError("context body failed")
+            assert cursor.description == []
+            assert cursor.fetchall() is None
+        finally:
+            cursor.close()
+
     def test_query_errors_propagate_and_next_query_succeeds(self, session_project):
         adapter = session_project.adapter
         missing = f"iceberg.{session_project.test_schema}.missing_{uuid4().hex}"
@@ -102,3 +129,35 @@ select * from {{ ref('orders') }}
                 )
             finally:
                 adapter.execute(f"drop view {temporary}")
+
+    @pytest.mark.parametrize("fast_listing", [False, True])
+    def test_catalog_columns_are_unique_and_preserve_identity(self, session_project, fast_listing):
+        adapter = session_project.adapter
+        schema = adapter.Relation.create(database="iceberg", schema=session_project.test_schema)
+        with adapter.connection_named("session_catalog_columns"):
+            relations = (
+                adapter.list_relations_without_caching(schema)
+                if fast_listing
+                else adapter._list_relations_v2_first({"schema_relation": schema}, schema)
+            )
+            columns = [
+                entry
+                for relation in relations
+                for entry in adapter._get_columns_for_catalog(relation)
+            ]
+        assert len(columns) == 4
+        assert {
+            (
+                entry["table_database"],
+                entry["table_schema"],
+                entry["table_name"],
+                entry["table_type"],
+                entry["column_name"],
+                entry["column_type"],
+            )
+            for entry in columns
+        } == {
+            ("iceberg", session_project.test_schema, name, kind, column, dtype)
+            for name, kind in [("orders", "table"), ("report", "view")]
+            for column, dtype in [("id", "bigint"), ("label", "string")]
+        }

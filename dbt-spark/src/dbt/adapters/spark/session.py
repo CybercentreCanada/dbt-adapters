@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 from types import TracebackType
-from typing import Any, Dict, List, Optional, Tuple, Union, Sequence
+from typing import Any, Dict, Iterator, List, Literal, Optional, Tuple, Type, Union, Sequence
 
 from dbt.adapters.spark.connections import SparkConnectionWrapper
 from dbt.adapters.events.logging import AdapterLogger
@@ -37,7 +37,7 @@ class Cursor:
 
     def __init__(self, *, server_side_parameters: Optional[Dict[str, Any]] = None) -> None:
         self._df: Optional[DataFrame] = None
-        self._rows: Optional[List[Row]] = None
+        self._rows: Optional[Iterator[Row]] = None
         self.server_side_parameters = server_side_parameters or {}
 
     def __enter__(self) -> Cursor:
@@ -45,12 +45,12 @@ class Cursor:
 
     def __exit__(
         self,
-        exc_type: Optional[BaseException],
-        exc_val: Optional[Exception],
+        exc_type: Optional[Type[BaseException]],
+        exc_val: Optional[BaseException],
         exc_tb: Optional[TracebackType],
-    ) -> bool:
+    ) -> Literal[False]:
         self.close()
-        return True
+        return False
 
     @property
     def description(
@@ -118,6 +118,7 @@ class Cursor:
         ------
         https://github.com/mkleehammer/pyodbc/wiki/Cursor#executesql-parameters
         """
+        self.close()
         if len(parameters) > 0:
             sql = sql % parameters
 
@@ -142,8 +143,8 @@ class Cursor:
         https://github.com/mkleehammer/pyodbc/wiki/Cursor#fetchall
         """
         if self._rows is None and self._df is not None:
-            self._rows = self._df.collect()
-        return self._rows
+            self._rows = self._df.toLocalIterator()
+        return list(self._rows) if self._rows is not None else None
 
     def fetchone(self) -> Optional[Row]:
         """
@@ -159,14 +160,8 @@ class Cursor:
         https://github.com/mkleehammer/pyodbc/wiki/Cursor#fetchone
         """
         if self._rows is None and self._df is not None:
-            self._rows = self._df.take(1)
-
-        if self._rows is not None and len(self._rows) > 0:
-            row = self._rows.pop(0)
-        else:
-            row = None
-
-        return row
+            self._rows = self._df.toLocalIterator()
+        return next(self._rows, None) if self._rows is not None else None
 
 
 class Connection:

@@ -44,6 +44,9 @@ class SparkRelation(BaseRelation):
         #     raise DbtRuntimeError("Cannot set database in spark!")
         pass
 
+    def quoted(self, identifier: str) -> str:
+        return super().quoted(identifier.replace(self.quote_character, self.quote_character * 2))
+
     # CCCS
     def render(self) -> str:
         # if self.include_policy.database and self.include_policy.schema:

@@ -1,6 +1,8 @@
 import pytest
 import yaml
 
+from dbt.adapters.spark.session import get_spark_session
+from dbt_common.exceptions import DbtRuntimeError
 from dbt.tests.util import relation_from_name, run_dbt, run_dbt_and_capture, write_file
 
 
@@ -120,6 +122,34 @@ class TestPartitionColumnSession(BasePartitionSyncSession):
 class TestPartitionTransformsSession(BasePartitionSyncSession):
     initial = ["days(event_time)", "bucket(8, id)"]
     desired = ["days(event_time)", "bucket(8, id)"]
+
+
+class TestPartitionEquivalentQuotingSession(BasePartitionSyncSession):
+    desired = ["`region`"]
+
+
+class TestPartitionEquivalentTransformSpacingSession(BasePartitionSyncSession):
+    initial = ["days(event_time)", "bucket(8, id)"]
+    desired = ["days( `event_time` )", "bucket(8,   `id`)"]
+
+
+class TestPartitionCaseSensitiveSession(BasePartitionSyncSession):
+    def test_partition_policy_uses_live_metadata(self, project):
+        assert len(run_dbt(["run"])) == 1
+        adapter = project.adapter
+        relation = relation_from_name(adapter, "events")
+        spark = get_spark_session(adapter.config.credentials.server_side_parameters)
+        original = spark.conf.get("spark.sql.caseSensitive")
+        try:
+            with adapter.connection_named("partition_case_sensitivity"):
+                spark.conf.set("spark.sql.caseSensitive", "false")
+                adapter.check_partition_sync(relation, "iceberg", ["REGION"])
+                spark.conf.set("spark.sql.caseSensitive", "true")
+                with pytest.raises(DbtRuntimeError, match="Partition drift detected"):
+                    adapter.check_partition_sync(relation, "iceberg", ["REGION"])
+                adapter.check_partition_sync(relation, "iceberg", ["`region`"])
+        finally:
+            spark.conf.set("spark.sql.caseSensitive", original)
 
 
 class TestPartitionDriftWarningSession(BasePartitionSyncSession):

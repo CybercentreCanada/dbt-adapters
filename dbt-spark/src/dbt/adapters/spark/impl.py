@@ -352,14 +352,16 @@ class SparkAdapter(SQLAdapter):
         else:
             raise DbtRuntimeError("BaseRelation is required to get the database name")
 
-        table_name = f"{database}.{_schema}.{name}"
-        try:
-            table_results = self.execute_macro(
-                DESCRIBE_TABLE_EXTENDED_MACRO_NAME, kwargs={"table_name": table_name}
-            )
-        except DbtRuntimeError as e:
-            logger.debug(f"Error while retrieving information about {table_name}: {e.msg}")
-            table_results = AttrDict()
+        table_name = (
+            schema_relation.replace_path(database=database, schema=_schema, identifier=name)
+            .include(identifier=True)
+            .render()
+        )
+        table_results = self.execute_macro(
+            DESCRIBE_TABLE_EXTENDED_MACRO_NAME, kwargs={"table_name": table_name}
+        )
+        if not table_results:
+            raise DbtRuntimeError(f"DESCRIBE returned no metadata for {table_name}")
 
         information = ""
         for info_row in table_results:
@@ -381,7 +383,13 @@ class SparkAdapter(SQLAdapter):
         relations = []
         for row in row_list:
             # CCCS pass schema_relation to get the database
-            _schema, name, information = relation_info_func(row, schema_relation)
+            try:
+                _schema, name, information = relation_info_func(row, schema_relation)
+            except DbtRuntimeError as exc:
+                if any(msg in exc.msg for msg in TABLE_OR_VIEW_NOT_FOUND_MESSAGES):
+                    logger.debug(f"Relation disappeared during listing: {row}: {exc.msg}")
+                    continue
+                raise
 
             rel_type: RelationType = (
                 RelationType.View
@@ -406,6 +414,8 @@ class SparkAdapter(SQLAdapter):
                 database=database,
                 schema=_schema,
                 identifier=name,
+                quote_policy=asdict(schema_relation.quote_policy),
+                include_policy={**asdict(schema_relation.include_policy), "identifier": True},
                 type=rel_type,
                 information=information,
                 is_delta=is_delta,
@@ -509,6 +519,8 @@ class SparkAdapter(SQLAdapter):
                 database=schema_relation.database,
                 schema=schema_relation.schema,
                 identifier=row[1],
+                quote_policy=asdict(schema_relation.quote_policy),
+                include_policy={**asdict(schema_relation.include_policy), "identifier": True},
                 type=RelationType("table"),
                 information="",
                 is_delta=False,
@@ -523,6 +535,8 @@ class SparkAdapter(SQLAdapter):
                 database=schema_relation.database,
                 schema=schema_relation.schema,
                 identifier=row[1],
+                quote_policy=asdict(schema_relation.quote_policy),
+                include_policy={**asdict(schema_relation.include_policy), "identifier": True},
                 type=RelationType("view"),
                 information="",
                 is_delta=False,
@@ -576,6 +590,8 @@ class SparkAdapter(SQLAdapter):
                 msg in errmsg for msg in TABLE_OR_VIEW_NOT_FOUND_MESSAGES
             ):
                 return []
+            if "not supported" not in errmsg.lower() and "UNSUPPORTED_" not in errmsg:
+                raise
             logger.debug(
                 f"v2 relation listing failed for {schema_relation}, "
                 f"falling back to SHOW TABLE EXTENDED: {errmsg}"
@@ -622,9 +638,9 @@ class SparkAdapter(SQLAdapter):
                 try:
                     return self._list_relations_using_describe(kwargs, schema_relation)
                 except DbtRuntimeError as e:
-                    description = "Error while retrieving information about"
-                    logger.debug(f"{description} {schema_relation}: {e.msg}")
-                    return []
+                    if any(msg in e.msg for msg in SCHEMA_NOT_FOUND_MESSAGES):
+                        return []
+                    raise
             else:
                 raise
 
@@ -726,41 +742,18 @@ class SparkAdapter(SQLAdapter):
         return columns
 
     def _get_columns_for_catalog(self, relation: BaseRelation) -> Iterable[Dict[str, Any]]:
-        # CCCS
-        if relation.is_iceberg:
-            # Iceberg information column does not contain the relation's schema (columns)
-            # Instead of parsing the information column we use the get_columns_in_relation macro
-            # this macro executes 'describe extended <table name>' which returns the column
-            # names and their type
-            rows: List[agate.Row] = super().get_columns_in_relation(relation)
-            columns = self.parse_describe_extended(relation, rows)
-            for column in columns:
-                # convert SparkColumns into catalog dicts
-                as_dict = column.to_column_dict()
-                as_dict["column_name"] = as_dict.pop("column", None)
-                as_dict["column_type"] = as_dict.pop("dtype")
-                as_dict["table_database"] = relation.database if relation.is_iceberg else None
-                yield as_dict
-        else:
-            columns = self.parse_columns_from_information(relation)
+        # Iceberg presentation metadata does not contain a parseable column schema.
+        columns = [] if relation.is_iceberg else self.parse_columns_from_information(relation)
 
         if not columns:
-            # The DESCRIBE EXTENDED fallback path (e.g. Iceberg v2 tables) embeds
-            # column definitions in the information string as flat "col: type"
-            # lines, which INFORMATION_COLUMNS_REGEX does not match.  Fall back
-            # to querying the table schema directly via DESCRIBE EXTENDED.
-            try:
-                columns = self.get_columns_in_relation(relation)
-            except DbtRuntimeError as e:
-                logger.debug(f"Error retrieving columns for catalog entry {relation}: {e.msg}")
-                columns = []
+            columns = self.get_columns_in_relation(relation)
 
         for column in columns:
             # convert SparkColumns into catalog dicts
             as_dict = column.to_column_dict()
             as_dict["column_name"] = as_dict.pop("column", None)
             as_dict["column_type"] = as_dict.pop("dtype")
-            as_dict["table_database"] = None
+            as_dict["table_database"] = relation.database
             yield as_dict
 
     def get_catalog(
@@ -1244,8 +1237,16 @@ class SparkAdapter(SQLAdapter):
         show_create_result = self.execute_macro(
             "fetch_partition_spec", kwargs={"relation": relation}
         )
-        existing = PartitionProcessor.from_show_create_table(show_create_result)
-        desired = PartitionProcessor.from_model_config(partition_by)
+        case_sensitive = False
+        if self.config.credentials.method == SparkConnectionMethod.SESSION:
+            from dbt.adapters.spark.session import get_spark_session
+
+            spark = get_spark_session(self.config.credentials.server_side_parameters)
+            case_sensitive = spark.conf.get("spark.sql.caseSensitive").lower() == "true"
+        existing = PartitionProcessor.from_show_create_table(
+            show_create_result, case_sensitive=case_sensitive
+        )
+        desired = PartitionProcessor.from_model_config(partition_by, case_sensitive=case_sensitive)
 
         if PartitionProcessor.is_out_of_sync(desired, existing):
             diff_msg = PartitionProcessor.describe_diff(desired, existing)
