@@ -1,0 +1,5 @@
+kind: Fixes
+body: Mark newly created Iceberg incremental relations as Iceberg in the relation cache so later microbatch batches in the same run (e.g. hourly batches partitioned by hours(event_time)) use Iceberg INSERT OVERWRITE syntax instead of failing with a partition clause syntax error.
+time: 2026-11-04T16:30:00-05:00
+custom:
+  Author: cccs-jn

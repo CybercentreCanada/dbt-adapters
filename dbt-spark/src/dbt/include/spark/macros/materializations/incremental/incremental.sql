@@ -103,6 +103,10 @@
       {{ create_table_as(False, target_relation, compiled_code, language) }}
     {%- endcall -%}
     {% endif %}
+    {#-- Keep the cached relation accurate so later microbatch batches take the Iceberg path. --#}
+    {% if file_format == 'iceberg' %}
+      {% set target_relation = target_relation.incorporate(is_iceberg=true) %}
+    {% endif %}
     {% do persist_constraints(target_relation, model) %}
     {% do apply_tblproperties(target_relation, config.get('tblproperties')) %}
   {%- elif existing_relation.is_view or should_full_refresh() -%}
@@ -124,6 +128,10 @@
     {%- call statement('main', language=language) -%}
       {{ create_table_as(False, target_relation, compiled_code, language) }}
     {%- endcall -%}
+    {% endif %}
+    {#-- Keep the cached relation accurate so later microbatch batches take the Iceberg path. --#}
+    {% if file_format == 'iceberg' %}
+      {% set target_relation = target_relation.incorporate(is_iceberg=true) %}
     {% endif %}
     {% do persist_constraints(target_relation, model) %}
     {% do apply_tblproperties(target_relation, config.get('tblproperties')) %}
