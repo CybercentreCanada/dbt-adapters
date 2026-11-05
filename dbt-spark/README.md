@@ -133,6 +133,19 @@ sudo dnf install -y unixODBC unixODBC-devel
 
 The following features have been added to dbt-spark beyond the upstream open-source version.
 
+### Session-Based Python Models
+
+Python models can execute in the dbt process using
+`submission_method: spark_session_based_cluster`. Configure the profile with
+`method: session` as well; the connection method alone does not select the
+Python submission helper. Existing-target incremental runs use session-scoped
+temporary views instead of physical staging tables.
+
+See the [session Python execution specification](specs/spec-design-spark-session-python-model-execution.md)
+for configuration, execution and conversion rules, session-sharing assumptions,
+dependency requirements, and limitations including timeout, cleanup, and
+replacement behavior.
+
 ### Fast Iceberg Relation Listing
 
 <!-- CCCS: session-only catalog detection and constant-query relation discovery. -->
@@ -458,6 +471,21 @@ hatch run write-order-tests:test
 resolving the artifact through Maven. See the
 [write-order specification](specs/spec-design-iceberg-write-order.md) for the full
 configuration and failure contracts.
+
+### Behavior Flag Specifications
+
+The adapter registers the following project-level flags. These specifications
+describe their defaults, scope, interactions, and validation criteria.
+
+| Flag | Default | Specification |
+|------|---------|---------------|
+| `check_partition_sync` | `false` | [Partition drift detection](../spec/spec-design-spark-flag-check-partition-sync.md) |
+| `check_partition_sync_raises` | `false` | [Partition drift severity](../spec/spec-design-spark-flag-check-partition-sync-raises.md) |
+| `use_v2_relation_listing` | `true` | [Relation listing preference](../spec/spec-design-spark-flag-use-v2-relation-listing.md) |
+| `iceberg_listing_fast` | `true` | [Iceberg fast listing](../spec/spec-design-spark-flag-iceberg-listing-fast.md) |
+| `set_partition_overwrite_mode` | `true` | [Partition overwrite setting](../spec/spec-design-spark-flag-set-partition-overwrite-mode.md) |
+| `require_location_root` | `true` | [Explicit storage locations](../spec/spec-design-spark-flag-require-location-root.md) |
+| `await_termination` | `false` | [Streaming model execution](specs/spec-design-spark-streaming-models.md) |
 
 ### Partition Drift Detection
 
