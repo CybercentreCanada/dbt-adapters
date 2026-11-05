@@ -1,0 +1,4 @@
+kind: Fixes
+body: |
+  Microbatch runs now sync partition checks, tblproperties and persisted docs once per invocation in the first (always sequential) batch, so concurrent batches no longer skip drift fixes or race on metadata commits. `persist_docs` now updates the table comment on existing tables with `COMMENT ON TABLE`, and table and column comments are only altered when they differ from the current values.
+time: 2026-09-29T00:00:00.000000-08:00

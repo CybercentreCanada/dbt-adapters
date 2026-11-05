@@ -1,4 +1,5 @@
 import os
+import subprocess
 
 import argparse
 import sys
@@ -9,6 +10,12 @@ import dagger as dagger
 from dotenv import find_dotenv, load_dotenv
 
 PG_PORT = 5432
+_DAGGER_ENGINE_NAME = "dagger-engine-custom"
+# Resolve absolute paths to sibling packages (Dagger blocks relative ".." paths)
+_SPARK_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # dbt-spark/
+_REPO_ROOT = os.path.dirname(_SPARK_DIR)  # monorepo root
+_DBT_ADAPTERS_DIR = os.path.join(_REPO_ROOT, "dbt-adapters")
+_DBT_TESTS_ADAPTER_DIR = os.path.join(_REPO_ROOT, "dbt-tests-adapter")
 load_dotenv(find_dotenv("test.env"))
 # if env vars aren't specified in test.env (i.e. in github actions worker), use the ones from the host
 TESTING_ENV_VARS = {
@@ -41,6 +48,68 @@ def get_postgres_container(client: dagger.Client) -> Tuple[dagger.Container, str
     return ctr, "postgres_db"
 
 
+_HOST_CA_CERT = "/etc/ssl/certs/ca-certificates.crt"
+_CONTAINER_CA_CERT = "/etc/ssl/certs/ca-certificates.crt"
+
+
+def _ensure_dagger_engine_with_certs() -> None:
+    """Start a custom Dagger engine container with host CA certs mounted.
+
+    Sets _EXPERIMENTAL_DAGGER_RUNNER_HOST so the Dagger SDK connects to this
+    engine instead of starting its own. No-op if the CA cert file is not present.
+    """
+    if not os.path.isfile(_HOST_CA_CERT):
+        return
+
+    # Check if custom engine is already running
+    result = subprocess.run(
+        ["docker", "inspect", "-f", "{{.State.Running}}", _DAGGER_ENGINE_NAME],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0 and "true" in result.stdout:
+        os.environ["_EXPERIMENTAL_DAGGER_RUNNER_HOST"] = (
+            f"docker-container://{_DAGGER_ENGINE_NAME}"
+        )
+        return
+
+    # Remove stale container if it exists
+    subprocess.run(["docker", "rm", "-f", _DAGGER_ENGINE_NAME], capture_output=True)
+
+    # Start a new Dagger engine with host CA certs mounted
+    subprocess.run(
+        [
+            "docker",
+            "run",
+            "-d",
+            "--name",
+            _DAGGER_ENGINE_NAME,
+            "--privileged",
+            "-v",
+            f"{_HOST_CA_CERT}:/etc/ssl/certs/ca-certificates.crt:ro",
+            "-v",
+            "dagger-engine-cache:/var/lib/dagger",
+            "registry.dagger.io/engine:v0.9.7",
+        ],
+        check=True,
+    )
+
+    os.environ["_EXPERIMENTAL_DAGGER_RUNNER_HOST"] = f"docker-container://{_DAGGER_ENGINE_NAME}"
+    print(f"Started custom Dagger engine '{_DAGGER_ENGINE_NAME}' with host CA certificates.")
+
+
+def _mount_system_certs(ctr: dagger.Container, client: dagger.Client) -> dagger.Container:
+    """Mount host CA certificates into the container if present on the host."""
+    if os.path.isfile(_HOST_CA_CERT):
+        ctr = (
+            ctr.with_file(_CONTAINER_CA_CERT, client.host().file(_HOST_CA_CERT))
+            .with_env_variable("SSL_CERT_FILE", _CONTAINER_CA_CERT)
+            .with_env_variable("REQUESTS_CA_BUNDLE", _CONTAINER_CA_CERT)
+            .with_env_variable("PIP_CERT", _CONTAINER_CA_CERT)
+        )
+    return ctr
+
+
 def get_spark_container(client: dagger.Client) -> Tuple[dagger.Service, str]:
     spark_dir = client.host().directory("./dagger/spark-container")
     spark_ctr_base = (
@@ -63,6 +132,9 @@ def get_spark_container(client: dagger.Client) -> Tuple[dagger.Service, str]:
         .with_file("/usr/spark/conf/hive-site.xml", spark_dir.file("/hive-site.xml"))
         .with_file("/usr/spark/conf/spark-defaults.conf", spark_dir.file("spark-defaults.conf"))
     )
+
+    # Mount system CA certificates if available on host
+    spark_ctr_base = _mount_system_certs(spark_ctr_base, client)
 
     # postgres is the metastore here
     pg_ctr, pg_host = get_postgres_container(client)
@@ -108,6 +180,9 @@ async def test_spark(test_args):
             .with_(env_variables(TESTING_ENV_VARS))
         )
 
+        # Mount system CA certificates if available on host
+        tst_container = _mount_system_certs(tst_container, client)
+
         # copy project files into image
         tst_container = (
             tst_container.with_workdir("/")
@@ -126,6 +201,9 @@ async def test_spark(test_args):
                     ],
                 ),
             )
+            # mount sibling packages so pre-install-commands can find them
+            .with_directory("/dbt-adapters", client.host().directory(_DBT_ADAPTERS_DIR))
+            .with_directory("/dbt-tests-adapter", client.host().directory(_DBT_TESTS_ADAPTER_DIR))
         )
 
         # install profile-specific system dependencies last since tests usually rotate through profiles
@@ -162,5 +240,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--profile", required=True, type=str)
 parser.add_argument("--test-path", required=False, type=str, default="tests/functional/adapter")
 args = parser.parse_args()
+
+# Ensure Dagger engine trusts host CA certificates (e.g. corporate proxy)
+_ensure_dagger_engine_with_certs()
 
 anyio.run(test_spark, args)

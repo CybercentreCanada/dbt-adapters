@@ -3,8 +3,8 @@ from dataclasses import dataclass, field
 
 from dbt.adapters.base.relation import BaseRelation, Policy
 from dbt.adapters.events.logging import AdapterLogger
-
 from dbt_common.exceptions import DbtRuntimeError
+from dbt.adapters.spark.relation_configs.write_order import CurrentWriteOrder
 
 logger = AdapterLogger("Spark")
 
@@ -37,6 +37,7 @@ class SparkRelation(BaseRelation):
     # TODO: make this a dict everywhere
     information: Optional[str] = None
     require_alias: bool = False
+    write_order: CurrentWriteOrder = field(default_factory=CurrentWriteOrder)
 
     # CCCS
     def __post_init__(self) -> None:
@@ -44,8 +45,15 @@ class SparkRelation(BaseRelation):
         #     raise DbtRuntimeError("Cannot set database in spark!")
         pass
 
+    def quoted(self, identifier: str) -> str:
+        return super().quoted(identifier.replace(self.quote_character, self.quote_character * 2))
+
     # CCCS
     def render(self) -> str:
+        if self.is_function:
+            if self.identifier is None:
+                raise DbtRuntimeError("A Spark function relation requires an identifier")
+            return self.quoted(self.identifier)
         # if self.include_policy.database and self.include_policy.schema:
         #     raise DbtRuntimeError(
         #         "Got a spark relation with schema and database set to "

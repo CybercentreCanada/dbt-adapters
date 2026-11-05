@@ -30,7 +30,7 @@ from datetime import datetime
 import sqlparams
 from dbt_common.dataclass_schema import StrEnum
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Union, Tuple, List, Generator, Iterable, Sequence
+from typing import Any, Callable, Dict, Optional, Union, Tuple, List, Generator, Iterable, Sequence
 
 from abc import ABC, abstractmethod
 
@@ -40,7 +40,7 @@ try:
     import thrift
     import ssl
     import thrift_sasl
-    from puresasl.client import SASLClient
+    from pyhive.sasl_compat import PureSASLClient as SASLClient
 except ImportError:
     TTransportException = None
     pass  # done deliberately: setting modules to None explicitly violates MyPy contracts by degrading type semantics
@@ -425,6 +425,16 @@ class PyodbcConnectionWrapper(PyhiveConnectionWrapper):
 
 class SparkConnectionManager(SQLConnectionManager):
     TYPE = "spark"
+    session_prepare: Optional[Callable[[Any], None]] = None
+
+    def add_query(self, *args: Any, **kwargs: Any) -> Tuple[Connection, Any]:
+        if self.profile.credentials.method == SparkConnectionMethod.SESSION:
+            from dbt.adapters.spark.session import SessionConnectionWrapper
+
+            handle = self.get_thread_connection().handle
+            if isinstance(handle, SessionConnectionWrapper):
+                handle.handle.prepare_session = self.session_prepare
+        return super().add_query(*args, **kwargs)
 
     SPARK_CLUSTER_HTTP_PATH = "/sql/protocolv1/o/{organization}/{cluster}"
     SPARK_SQL_ENDPOINT_HTTP_PATH = "/sql/1.0/endpoints/{endpoint}"
@@ -665,7 +675,9 @@ class SparkConnectionManager(SQLConnectionManager):
                     logger.warning(msg)
                     time.sleep(creds.connect_timeout)
                 else:
-                    raise FailedToConnectError("failed to connect") from e
+                    raise FailedToConnectError(
+                        f"failed to connect: {type(e).__name__}: {e}"
+                    ) from e
         else:
             raise exc  # type: ignore
 
@@ -700,7 +712,14 @@ def build_ssl_transport(
         port = 10000
     if auth is None:
         auth = "NONE"
-    socket = TSSLSocket(host, port, cert_reqs=ssl.CERT_NONE)
+
+    # newer versions of thrift changed TSSLSocket to no longer
+    # directly accept CERT_NONE, so pass ssl context instead
+    ssl_context = ssl.create_default_context()
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+    socket = TSSLSocket(host, port, ssl_context=ssl_context)
+
     if auth == "NOSASL":
         # NOSASL corresponds to hive.server2.authentication=NOSASL
         # in hive-site.xml
@@ -713,6 +732,10 @@ def build_ssl_transport(
             sasl_auth = "GSSAPI"
         else:
             sasl_auth = "PLAIN"
+            if username is None:
+                # Username doesn't matter in NONE mode, just needs
+                # to be nonempty.
+                username = "dbt"
             if password is None:
                 # Password doesn't matter in NONE mode, just needs
                 # to be nonempty.

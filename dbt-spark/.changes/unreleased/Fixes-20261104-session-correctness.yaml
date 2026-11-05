@@ -1,0 +1,5 @@
+kind: Fixes
+body: Correct Spark session cursor result consumption and exception propagation, preserve unique catalog column identity, surface relation metadata errors, and normalize Iceberg partition expressions without losing quoted identifier semantics.
+time: 2026-11-04T15:38:22-05:00
+custom:
+  Author: cccs-jn

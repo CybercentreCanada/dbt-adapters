@@ -1,7 +1,7 @@
 import base64
 import time
 import requests
-from typing import Any, Dict, Callable, Iterable
+from typing import Any, Dict, Callable, Iterable, Optional
 import uuid
 
 from dbt.adapters.base import PythonJobHelper
@@ -12,7 +12,6 @@ from dbt.adapters.spark import __version__
 
 # CCCS
 import traceback
-import dbt
 from pyspark.sql import SparkSession
 
 DEFAULT_POLLING_INTERVAL = 10
@@ -299,25 +298,54 @@ class AllPurposeClusterPythonJobHelper(BaseDatabricksHelper):
             finally:
                 context.destroy(context_id)
 
+
 # CCCS
 class SparkSessionBasedClusterPythonJobHelper(PythonJobHelper):
     """
     Submit python to local spark driver session.
     """
 
-    def __init__(self, parsed_model: Dict, credential: SparkCredentials) -> None:
+    def __init__(
+        self,
+        parsed_model: Dict,
+        credential: SparkCredentials,
+        spark_session: Optional[SparkSession] = None,
+    ) -> None:
         self.parsed_model = parsed_model
+        self.server_side_parameters = credential.server_side_parameters
+        self.spark_session = spark_session
 
     def submit(self, compiled_code: str) -> None:
         try:
             from copy import deepcopy
+            import datetime
 
-            spark = SparkSession.builder.getOrCreate()  # Local passed to compiled_code call
+            # 1. Explicitly import tzlocal
+            import tzlocal  # type: ignore[import-untyped]
+
+            from dbt.adapters.spark.session import get_spark_session
+
+            spark = self.spark_session or get_spark_session(self.server_side_parameters)
             model_config = deepcopy(self.parsed_model.get("config"))
+
+            # Fix the code if it contains invalid representations like <UTC>
             # When a python model with incremental_strategy: microbatch, the date code needs to be fixed,
             # This line is inserted into python models but the <UTC> is not valid python code config_dict = {'__dbt_internal_microbatch_event_time_start': datetime.datetime(2025, 7, 30, 0, 0, tzinfo=<UTC>), '__dbt_internal_microbatch_event_time_end': datetime.datetime(2025, 7, 30, 1, 0, tzinfo=<UTC>), 'target': {}}
             fix_code = compiled_code.replace("<UTC>", "datetime.timezone.utc")
-            exec(fix_code, locals())
+            fix_code = fix_code.replace("tzlocal()", "tzlocal.get_localzone()")
+
+            # 2. Create a clean execution namespace and inject all required dependencies
+            exec_namespace = {
+                "spark": spark,
+                "datetime": datetime,
+                "tzlocal": tzlocal,  # Make tzlocal available to the executed code
+            }
+
+            # Bring in other local variables if your code depends on them
+            exec_namespace.update(locals())
+
+            # 3. Execute using the explicit namespace dictionary
+            exec(fix_code, exec_namespace)
         except Exception as e:
             print(f"There's an issue with the Python model. See trace: {traceback.format_exc()}")
-            raise DbtRuntimeError("The Python model failed") from e
+            raise DbtRuntimeError(f"The Python model failed: {e}") from e

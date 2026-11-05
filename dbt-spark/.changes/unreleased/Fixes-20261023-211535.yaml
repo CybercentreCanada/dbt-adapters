@@ -1,0 +1,3 @@
+kind: Fixes
+body: Avoid deprecated Spark partition transform helpers when creating Python batch tables and Python or SQL streaming sink tables on Spark 4, while retaining legacy-runtime support and unchanged partition_by syntax.
+time: 2026-10-23T21:15:35.721710985-04:00

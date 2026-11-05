@@ -6,11 +6,13 @@ packages = ["src/dbt"]
 sources = ["src"]
 
 [envs.default]
+pre-install-commands = [
+    "pip install dbt-core@git+https://github.com/dbt-labs/dbt-core.git@1.latest#subdirectory=core",
+    "pip install -e ../dbt-adapters",
+    "pip install -e ../dbt-tests-adapter",
+]
 dependencies = [
-    "dbt-adapters @ git+https://github.com/dbt-labs/dbt-adapters.git#subdirectory=dbt-adapters",
     "dbt-common @ git+https://github.com/dbt-labs/dbt-common.git",
-    "dbt-tests-adapter @ git+https://github.com/dbt-labs/dbt-adapters.git#subdirectory=dbt-tests-adapter",
-    "dbt-core @ git+https://github.com/dbt-labs/dbt-core.git#subdirectory=core",
     "ddtrace==2.3.0",
     "ipdb~=0.13.13",
     "pre-commit==3.7.0",
@@ -18,10 +20,9 @@ dependencies = [
     "pytest>=7.0,<8.0",
     "pytest-csv~=3.0",
     "pytest-dotenv",
-    "pytest-logbook~=1.2",
-    "logbook<1.9",
     "pytest-mock",
     "pytest-xdist",
+    "tenacity",
 ]
 features=["all"]
 
@@ -34,6 +35,63 @@ code-quality = "pre-commit run --all-files"
 unit-tests = "python -m pytest {args:tests/unit}"
 integration-tests = "python dagger/run_dbt_spark_tests.py {args:--profile apache_spark}"
 docker-prod = "docker build -f docker/Dockerfile -t dbt-spark ."
+
+[envs.local-spark-tests]
+detached = true
+dependencies = [
+    "jinja2>=3.1,<4.0",
+    "pyspark==4.1.3",
+    "pytest>=7.0,<8.0",
+    "pytest-xdist",
+]
+
+[envs.local-spark-tests.scripts]
+test = "DBT_RUN_LOCAL_SPARK_TESTS=1 python -m pytest --noconftest tests/unit/test_streaming_materialization_live.py -n 0 {args}"
+
+[envs.local-spark-iceberg]
+template = "local-spark-iceberg"
+skip-install = false
+pre-install-commands = [
+    "pip install dbt-core@git+https://github.com/dbt-labs/dbt-core.git@1.latest#subdirectory=core",
+    "pip install -e ../dbt-adapters",
+    "pip install -e ../dbt-tests-adapter",
+]
+dependencies = [
+    "ddtrace==2.3.0",
+    "freezegun",
+    "pytest>=7.0,<8.0",
+    "pytest-csv~=3.0",
+    "pytest-dotenv",
+    "pytest-mock",
+    "pytest-xdist",
+    "tenacity",
+    "pyspark==4.1.3",
+    "tzlocal>=5,<6",
+]
+features = ["session"]
+
+[envs.local-spark-iceberg.scripts]
+unit-tests = "python -m pytest --noconftest tests/unit/test_local_spark_iceberg.py tests/unit/test_session_correctness.py tests/unit/test_partition_sync.py tests/unit/test_tblproperties.py tests/unit/test_column_comments.py tests/unit/test_column.py tests/unit/test_local_test_runner.py -n 0 {args}"
+adapter-tests = "python -m pytest tests/functional/adapter/test_adapter_session.py tests/functional/adapter/test_metadata_session.py tests/functional/adapter/test_constraints_session.py tests/functional/adapter/tblproperties/test_iceberg_tblproperties.py --profile local_spark_iceberg -n 0 {args}"
+functional-tests = "DBT_RUN_ICEBERG_LISTING_TESTS=1 python -m pytest tests/functional/adapter/tblproperties/test_iceberg_tblproperties.py tests/functional/adapter/incremental_strategies/test_microbatch.py tests/functional/adapter/incremental_strategies/test_microbatch_session.py tests/functional/adapter/test_iceberg_listing.py tests/functional/adapter/test_python_incremental_staging_location.py tests/functional/adapter/test_adapter_session.py tests/functional/adapter/test_metadata_session.py tests/functional/adapter/test_constraints_session.py --profile local_spark_iceberg -n 0 {args}"
+
+[envs.write-order-tests]
+detached = true
+skip-install = false
+path = ".hatch/write-order-tests"
+dependencies = [
+    "dbt-core>=1.8,<2.0",
+    "dbt-adapters>=1.24.1,<2.0",
+    "pyspark==4.0.3",
+    "pytest>=7.0,<8.0",
+    "pytest-xdist",
+    "pytest-dotenv",
+    "tzlocal>=5,<6",
+]
+
+[envs.write-order-tests.scripts]
+unit-tests = "python -m pytest --noconftest tests/unit/test_write_order.py tests/unit/test_write_order_parse.py -n 0 {args}"
+test = "DBT_RUN_WRITE_ORDER_TESTS=1 python -m pytest --noconftest tests/unit/test_write_order.py tests/unit/test_write_order_parse.py tests/unit/test_write_order_live.py -n 0 {args}"
 
 [envs.build]
 detached = true
@@ -61,19 +119,21 @@ check-sdist = [
 docker-prod = "docker build -f docker/Dockerfile -t dbt-spark ."
 
 [envs.ci]
+pre-install-commands = [
+    "pip install pip-system-certs",
+    "pip install dbt-core@git+https://github.com/dbt-labs/dbt-core.git#subdirectory=core",
+    "pip install -e ../dbt-adapters",
+    "pip install -e ../dbt-tests-adapter",
+]
 dependencies = [
-    "dbt-adapters @ git+https://github.com/dbt-labs/dbt-adapters.git#subdirectory=dbt-adapters",
     "dbt-common @ git+https://github.com/dbt-labs/dbt-common.git",
-    "dbt-tests-adapter @ git+https://github.com/dbt-labs/dbt-adapters.git#subdirectory=dbt-tests-adapter",
-    "dbt-core @ git+https://github.com/dbt-labs/dbt-core.git#subdirectory=core",
     "ddtrace==2.3.0",
     "freezegun",
     "pytest>=7.0,<8.0",
     "pytest-csv~=3.0",
-    "pytest-logbook~=1.2",
-    "logbook<1.9",
     "pytest-mock",
     "pytest-xdist",
+    "tenacity",
 ]
 features=["all"]
 
@@ -91,10 +151,9 @@ dependencies = [
     "freezegun",
     "pytest>=7.0,<8.0",
     "pytest-csv~=3.0",
-    "pytest-logbook~=1.2",
-    "logbook<1.9",
     "pytest-mock",
     "pytest-xdist",
+    "tenacity",
 ]
 features=["all"]
 

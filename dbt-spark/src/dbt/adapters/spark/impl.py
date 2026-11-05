@@ -1,7 +1,10 @@
 import os
 import re
+import sys
+import threading
+from pathlib import Path
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import (
     Any,
     Dict,
@@ -15,6 +18,8 @@ from typing import (
     Set,
     FrozenSet,
     TYPE_CHECKING,
+    Mapping,
+    Sequence,
 )
 
 from dbt.adapters.base.relation import InformationSchema
@@ -29,26 +34,128 @@ if TYPE_CHECKING:
     # Indirectly imported via agate_helper, which is lazy loaded further downfile.
     # Used by mypy for earlier type hints.
     import agate
+    from pyspark.sql import SparkSession
 
 from dbt.adapters.base import AdapterConfig, PythonJobHelper
 from dbt.adapters.base.impl import catch_as_completed, ConstraintSupport
+from dbt.adapters.base.meta import available
 from dbt.adapters.sql import SQLAdapter
 from dbt.adapters.spark import SparkConnectionManager
 from dbt.adapters.spark import SparkRelation
 from dbt.adapters.spark import SparkColumn
-
-# CCCS
+from dbt.adapters.spark.connections import SparkConnectionMethod
+from dbt.adapters.spark.functions import SparkFunction, SparkFunctionRegistry
+from dbt.adapters.spark.relation_configs.tblproperties import (
+    TblPropertiesDiff,
+    TblPropertiesProcessor,
+)
+from dbt.adapters.spark.relation_configs.partitions import (
+    PartitionProcessor,
+)
+from dbt.adapters.spark.relation_configs import write_order as write_order_module
+from dbt.adapters.spark.relation_configs.write_order import (
+    CurrentWriteOrder,
+    WriteOrder,
+    WriteOrderManager,
+    quote_identifier,
+    sql_string,
+)
 from dbt.adapters.spark.python_submissions import (
     JobClusterPythonJobHelper,
     AllPurposeClusterPythonJobHelper,
     SparkSessionBasedClusterPythonJobHelper,
 )
 from dbt.adapters.capability import CapabilityDict, CapabilitySupport, Support, Capability
-
 from dbt.adapters.base import BaseRelation
 from dbt.adapters.contracts.relation import RelationType, RelationConfig
 from dbt_common.clients.agate_helper import DEFAULT_TYPE_TESTER
 from dbt_common.contracts.constraints import ConstraintType
+
+# Behavior flags for partition drift detection
+CHECK_PARTITION_SYNC = {
+    "name": "check_partition_sync",
+    "default": False,
+    "description": (
+        "When enabled, dbt will compare the model's partition_by config against the existing "
+        "Iceberg table partition spec on incremental runs. If they differ, a warning is logged "
+        "or an error is raised depending on the check_partition_sync_raises flag."
+    ),
+}
+
+CHECK_PARTITION_SYNC_RAISES = {
+    "name": "check_partition_sync_raises",
+    "default": False,
+    "description": (
+        "When enabled alongside check_partition_sync, dbt will raise an exception instead of "
+        "logging a warning when the model's partition_by config does not match the existing "
+        "Iceberg table partition spec."
+    ),
+}
+
+# CCCS behavior flag to use v2 relation listing (SHOW TABLES + DESCRIBE EXTENDED)
+USE_V2_RELATION_LISTING = {
+    "name": "use_v2_relation_listing",
+    "default": True,
+    "description": (
+        "When enabled, dbt uses SHOW TABLES + DESCRIBE EXTENDED (v2) as the primary method "
+        "for listing relations, which is compatible with Iceberg v2 tables. Falls back to "
+        "SHOW TABLE EXTENDED (v1) on failure. Disable for legacy Spark catalogs that do not "
+        "support v2 table listing."
+    ),
+}
+
+# CCCS skip per-relation DESCRIBE only for confirmed Iceberg-only session catalogs.
+ICEBERG_LISTING_FAST = {
+    "name": "iceberg_listing_fast",
+    "default": True,
+    "description": (
+        "When enabled alongside use_v2_relation_listing, dbt lists persistent relations "
+        "in Iceberg-only session catalogs with SHOW TABLES and SHOW VIEWS, without "
+        "per-table DESCRIBE. Disable to use the existing v2-first relation listing."
+    ),
+}
+
+# CCCS behavior flag to control SET spark.sql.sources.partitionOverwriteMode = DYNAMIC
+SET_PARTITION_OVERWRITE_MODE = {
+    "name": "set_partition_overwrite_mode",
+    "default": True,
+    "description": (
+        "When enabled, dbt emits `SET spark.sql.sources.partitionOverwriteMode = DYNAMIC` "
+        "before insert_overwrite and microbatch operations that use partition_by. On Iceberg "
+        "this is a no-op (Iceberg handles dynamic overwrite natively), but it serves as a "
+        "defensive measure. Disable if the session-level SET causes issues in your environment."
+    ),
+}
+
+# CCCS behavior flag to require location_root on all table materializations
+REQUIRE_LOCATION_ROOT = {
+    "name": "require_location_root",
+    "default": True,
+    "description": (
+        "When enabled, dbt will raise a compiler error if a table materialization does not "
+        "specify a location_root config. This ensures all tables are created at explicit "
+        "storage locations."
+    ),
+}
+
+AWAIT_TERMINATION = {
+    "name": "await_termination",
+    "default": False,
+    "description": (
+        "When enabled, dbt waits for a Python streaming model to terminate before completing "
+        "the run. A model-level await_termination config overrides this default."
+    ),
+}
+
+SPARK_TABLE_ONLY = {
+    "name": "spark_table_only",
+    "default": False,
+    "description": (
+        "Opt into table-only discovery and reject persistent view materializations. "
+        "Use with the native Spark parser for SQL UDFs when the Iceberg SQL extension "
+        "does not implement routine parameter parsing."
+    ),
+}
 
 logger = AdapterLogger("Spark")
 packages = ["pyhive.hive", "thrift.transport", "thrift.protocol"]
@@ -65,6 +172,16 @@ DESCRIBE_TABLE_EXTENDED_MACRO_NAME = "describe_table_extended_without_caching"
 
 KEY_TABLE_OWNER = "Owner"
 KEY_TABLE_STATISTICS = "Statistics"
+KEY_TABLE_COMMENT = "Comment"
+KEY_DETAILED_TABLE_INFORMATION = "# Detailed Table Information"
+
+SCHEMA_NOT_FOUND_MESSAGES = (
+    "[SCHEMA_NOT_FOUND]",
+    "Schema not found",
+    "Database not found",
+    "NoSuchNamespaceException",
+    "NoSuchDatabaseException",
+)
 
 TABLE_OR_VIEW_NOT_FOUND_MESSAGES = (
     "[TABLE_OR_VIEW_NOT_FOUND]",
@@ -72,16 +189,27 @@ TABLE_OR_VIEW_NOT_FOUND_MESSAGES = (
     "NoSuchTableException",
 )
 
+# CCCS SparkSessionCatalog can contain non-Iceberg tables and must not qualify.
+_ICEBERG_ONLY_CATALOG_CLASSES = frozenset({"org.apache.iceberg.spark.SparkCatalog"})
+
 
 @dataclass
 class SparkConfig(AdapterConfig):
-    file_format: str = "parquet"
+    spark_function_scope: Optional[str] = None
+    file_format: str = "iceberg"
     location_root: Optional[str] = None
     partition_by: Optional[Union[List[str], str]] = None
     clustered_by: Optional[Union[List[str], str]] = None
     buckets: Optional[int] = None
     options: Optional[Dict[str, str]] = None
+    tblproperties: Optional[Dict[str, str]] = None
     merge_update_columns: Optional[str] = None
+    await_termination: Optional[bool] = None
+    checkpoint_basedir: Optional[str] = None
+    trigger: Optional[str] = None
+    write_stream_options: Optional[Dict[str, str]] = None
+    read_stream_options: Optional[Dict[str, str]] = None
+    write_order: Optional[List[str]] = None
 
 
 class SparkAdapter(SQLAdapter):
@@ -127,7 +255,17 @@ class SparkAdapter(SQLAdapter):
 
     # CCCS
     _capabilities = CapabilityDict(
-        {Capability.SchemaMetadataByRelations: CapabilitySupport(support=Support.Full)}
+        {
+            Capability.SchemaMetadataByRelations: CapabilitySupport(support=Support.Full),
+            # Microbatch batches can run concurrently because:
+            #   1. Each batch gets a unique tmp relation suffixed with model.batch.id
+            #      (see macros/materializations/incremental/incremental.sql).
+            #   2. Microbatch is gated to file_format='iceberg', whose snapshot-isolated
+            #      INSERT OVERWRITE is safe for concurrent writers to disjoint partitions.
+            #   3. The partitionOverwriteMode SET is controlled by the
+            #      set_partition_overwrite_mode behavior flag; on Iceberg it is a no-op.
+            Capability.MicrobatchConcurrency: CapabilitySupport(support=Support.Full),
+        }
     )
 
     Relation: TypeAlias = SparkRelation
@@ -135,6 +273,139 @@ class SparkAdapter(SQLAdapter):
     Column: TypeAlias = SparkColumn
     ConnectionManager: TypeAlias = SparkConnectionManager
     AdapterSpecificConfigs: TypeAlias = SparkConfig
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._metadata_sync_lock = threading.Lock()
+        self._metadata_sync_claims: Set[Tuple[str, str]] = set()
+        # CCCS isolate classifications by actual session; serialize concurrent cache misses.
+        self._catalog_class_cache: Dict[Tuple["SparkSession", str], bool] = {}
+        self._catalog_class_lock = threading.Lock()
+        self._functions = SparkFunctionRegistry()
+        if self.type() == "spark" and isinstance(self.connections, SparkConnectionManager):
+            self.connections.session_prepare = self._functions.ensure
+
+    def _function_session(self) -> "SparkSession":
+        if self.config.credentials.method != SparkConnectionMethod.SESSION:
+            raise DbtRuntimeError("Spark session functions require a method: session profile")
+        from dbt.adapters.spark.session import get_spark_session
+
+        return get_spark_session(self.config.credentials.server_side_parameters)
+
+    @available
+    def validate_spark_function(
+        self, model: Mapping[str, Any], selected_functions: Sequence[Mapping[str, Any]]
+    ) -> None:
+        spark = self._function_session()
+        function = SparkFunction.from_model(model)
+        function.validate_session(spark)
+        self._functions.validate_names(spark, selected_functions)
+
+    @available
+    def spark_function_build_value(self, model: Mapping[str, Any]) -> Union[str, Dict[str, Any]]:
+        function = SparkFunction.from_model(model)
+        if function.language == "sql":
+            return function.sql()
+        return {"kind": "spark_python_udf", **asdict(function)}
+
+    @available
+    def register_spark_function(
+        self, model: Mapping[str, Any], build_value: Union[str, Mapping[str, Any]]
+    ) -> AdapterResponse:
+        function = SparkFunction.from_model(model)
+        expected = self.spark_function_build_value(model)
+        if build_value != expected:
+            raise DbtRuntimeError(
+                f"Invalid registration value for Spark function {function.unique_id}"
+            )
+        self._functions.build(self._function_session(), function)
+        return AdapterResponse(_message="OK")
+
+    def pre_model_hook(self, config: Mapping[str, Any]) -> Any:
+        self.validate_write_order_config(config, config.get("alias") or "model")
+        if self._table_only_mode and config.get("materialized") in ("view", "materialized_view"):
+            raise DbtRuntimeError(
+                "spark_table_only excludes persistent view materializations; "
+                "disable it only with a catalog/parser supporting view discovery"
+            )
+        context = super().pre_model_hook(config)
+        model = getattr(config, "model", None)
+        if self.type() != "spark" or model is None:
+            return context
+        dependencies = [dep for dep in model.depends_on.nodes if dep.startswith("function.")]
+        self._functions.require(dependencies)
+        if dependencies:
+            if model.config.materialized == "streaming":
+                raise DbtRuntimeError("Spark session functions do not support streaming consumers")
+            if (
+                model.language == "python"
+                and model.config.get("submission_method", self.default_python_submission_method)
+                != "spark_session_based_cluster"
+            ):
+                raise DbtRuntimeError("Spark session functions require session Python submission")
+            self._functions.ensure(self._function_session())
+        return context
+
+    @available
+    def cache_added(self, relation: Optional[BaseRelation]) -> str:
+        if self.type() == "spark" and relation is not None and relation.is_function:
+            return ""
+        return super().cache_added(relation)
+
+    def cleanup_connections(self) -> None:
+        active_error = sys.exc_info()[0] is not None
+        errors = self._functions.cleanup()
+        try:
+            super().cleanup_connections()
+        finally:
+            for error in errors:
+                logger.error(str(error))
+        if errors and not active_error:
+            raise errors[0]
+
+    def submit_python_job(self, parsed_model: dict, compiled_code: str) -> AdapterResponse:
+        submission = parsed_model["config"].get(
+            "submission_method", self.default_python_submission_method
+        )
+        if self.type() == "spark" and submission == "spark_session_based_cluster":
+            dependencies = [
+                dep
+                for dep in parsed_model.get("depends_on", {}).get("nodes", [])
+                if dep.startswith("function.")
+            ]
+            self._functions.require(dependencies)
+            if not dependencies and not self._functions.has_definitions:
+                return super().submit_python_job(parsed_model, compiled_code)
+            # Pass the actual registered session to the helper, not a second acquisition.
+            spark = self._function_session()
+            self._functions.ensure(spark)
+            helper = self.python_submission_helpers[submission](
+                parsed_model, self.config.credentials
+            )
+            if not isinstance(helper, SparkSessionBasedClusterPythonJobHelper):
+                raise DbtRuntimeError("Session Python submission requires a session-aware helper")
+            helper.spark_session = spark
+            helper.submit(compiled_code)
+            return self.generate_python_submission_response(None)
+        return super().submit_python_job(parsed_model, compiled_code)
+
+    # CCCS register all behavior flags for partition drift and relation listing order
+    @property
+    def _behavior_flags(self) -> List[Dict[str, Any]]:
+        return [
+            CHECK_PARTITION_SYNC,
+            CHECK_PARTITION_SYNC_RAISES,
+            USE_V2_RELATION_LISTING,
+            ICEBERG_LISTING_FAST,
+            SET_PARTITION_OVERWRITE_MODE,
+            REQUIRE_LOCATION_ROOT,
+            AWAIT_TERMINATION,
+            SPARK_TABLE_ONLY,
+        ]
+
+    @property
+    def _table_only_mode(self) -> bool:
+        return self.type() == "spark" and bool(getattr(self.behavior, "spark_table_only", False))
 
     @classmethod
     def date_function(cls) -> str:
@@ -171,7 +442,9 @@ class SparkAdapter(SQLAdapter):
         return "`{}`".format(identifier)
 
     # CCCS schema_relation added to the method signature
-    def _get_relation_information(self, row: "agate.Row", schema_relation: BaseRelation) -> RelationInfo:
+    def _get_relation_information(
+        self, row: "agate.Row", schema_relation: BaseRelation
+    ) -> RelationInfo:
         """relation info was fetched with SHOW TABLES EXTENDED"""
         try:
             _schema, name, _, information = row
@@ -183,7 +456,9 @@ class SparkAdapter(SQLAdapter):
         return _schema, name, information
 
     # CCCS schema_relation added to get the database
-    def _get_relation_information_using_describe(self, row: "agate.Row", schema_relation: BaseRelation) -> RelationInfo:
+    def _get_relation_information_using_describe(
+        self, row: "agate.Row", schema_relation: BaseRelation
+    ) -> RelationInfo:
         """Relation info fetched using SHOW TABLES and an auxiliary DESCRIBE statement"""
         try:
             _schema, name, _ = row
@@ -202,19 +477,21 @@ class SparkAdapter(SQLAdapter):
         else:
             raise DbtRuntimeError("BaseRelation is required to get the database name")
 
-        table_name = f"{database}.{_schema}.{name}"
-        try:
-            table_results = self.execute_macro(
-                DESCRIBE_TABLE_EXTENDED_MACRO_NAME, kwargs={"table_name": table_name}
-            )
-        except DbtRuntimeError as e:
-            logger.debug(f"Error while retrieving information about {table_name}: {e.msg}")
-            table_results = AttrDict()
+        table_name = (
+            schema_relation.replace_path(database=database, schema=_schema, identifier=name)
+            .include(identifier=True)
+            .render()
+        )
+        table_results = self.execute_macro(
+            DESCRIBE_TABLE_EXTENDED_MACRO_NAME, kwargs={"table_name": table_name}
+        )
+        if not table_results:
+            raise DbtRuntimeError(f"DESCRIBE returned no metadata for {table_name}")
 
         information = ""
         for info_row in table_results:
             info_type, info_value, _ = info_row
-            if not info_type.startswith("#"):
+            if not info_type.startswith("#") or info_type == KEY_DETAILED_TABLE_INFORMATION:
                 information += f"{info_type}: {info_value}\n"
 
         return _schema, name, information
@@ -231,7 +508,13 @@ class SparkAdapter(SQLAdapter):
         relations = []
         for row in row_list:
             # CCCS pass schema_relation to get the database
-            _schema, name, information = relation_info_func(row, schema_relation)
+            try:
+                _schema, name, information = relation_info_func(row, schema_relation)
+            except DbtRuntimeError as exc:
+                if any(msg in exc.msg for msg in TABLE_OR_VIEW_NOT_FOUND_MESSAGES):
+                    logger.debug(f"Relation disappeared during listing: {row}: {exc.msg}")
+                    continue
+                raise
 
             rel_type: RelationType = (
                 RelationType.View
@@ -256,58 +539,247 @@ class SparkAdapter(SQLAdapter):
                 database=database,
                 schema=_schema,
                 identifier=name,
+                quote_policy=asdict(schema_relation.quote_policy),
+                include_policy={**asdict(schema_relation.include_policy), "identifier": True},
                 type=rel_type,
                 information=information,
                 is_delta=is_delta,
                 is_iceberg=is_iceberg,
                 is_hudi=is_hudi,
+                write_order=asdict(
+                    CurrentWriteOrder.from_describe(
+                        [line.split(": ", 1) for line in information.splitlines() if ": " in line]
+                    )
+                ),
             )
             relations.append(relation)
 
         return relations
 
+    # CCCS dispatches relation listing to v2-first (default) or v1-first based on behavior flag
     def list_relations_without_caching(self, schema_relation: BaseRelation) -> List[BaseRelation]:
         """Distinct Spark compute engines may not support the same SQL featureset. Thus, we must
-        try different methods to fetch relation information."""
+        try different methods to fetch relation information.
+
+        CCCS: Iceberg-only session catalogs use SHOW TABLES and SHOW VIEWS without
+        per-table DESCRIBE when iceberg_listing_fast and use_v2_relation_listing are enabled.
+
+        By default (use_v2_relation_listing=True), uses SHOW TABLES + DESCRIBE EXTENDED (v2)
+        which works with Iceberg v2 tables. Falls back to SHOW TABLE EXTENDED (v1) on failure.
+
+        When use_v2_relation_listing is disabled, uses SHOW TABLE EXTENDED (v1) first and falls
+        back to v2 when encountering the 'not supported for v2 tables' error.
+        """
 
         kwargs = {"schema_relation": schema_relation}
+
+        if self._table_only_mode:
+            if self.behavior.iceberg_listing_fast and self._catalog_is_iceberg_only(
+                schema_relation.database
+            ):
+                return self._list_relations_fast(schema_relation)
+            return [
+                relation
+                for relation in self._list_relations_using_describe(kwargs, schema_relation)
+                if relation.is_table
+            ]
+        if (
+            self.behavior.use_v2_relation_listing
+            and self.behavior.iceberg_listing_fast
+            and self._catalog_is_iceberg_only(schema_relation.database)
+        ):
+            return self._list_relations_fast(schema_relation)
+
+        if self.behavior.use_v2_relation_listing:
+            return self._list_relations_v2_first(kwargs, schema_relation)
+        else:
+            return self._list_relations_v1_first(kwargs, schema_relation)
+
+    # CCCS detect once per session/catalog, never infer provider from model configuration.
+    def _catalog_is_iceberg_only(self, catalog: Optional[str]) -> bool:
+        """Recognize Iceberg SparkCatalog; unknown results retain regular listing."""
+        if self.config.credentials.method != SparkConnectionMethod.SESSION:
+            return False
+
+        from py4j.protocol import Py4JError
+        from pyspark.sql.utils import AnalysisException, IllegalArgumentException
+
+        from dbt.adapters.spark.session import get_spark_session
+
         try:
-            # Default compute engine behavior: show tables extended
+            spark = get_spark_session(self.config.credentials.server_side_parameters)
+            catalog = catalog or spark.catalog.currentCatalog()
+            cache_key = (spark, catalog)
+            with self._catalog_class_lock:
+                if cache_key in self._catalog_class_cache:
+                    return self._catalog_class_cache[cache_key]
+
+                # An absent setting is normal; avoid an exception-driven lookup.
+                catalog_class = spark.conf.get(f"spark.sql.catalog.{catalog}", None)
+                if catalog_class is None:
+                    catalog_class = (
+                        spark._jsparkSession.sessionState()
+                        .catalogManager()
+                        .catalog(catalog)
+                        .getClass()
+                        .getName()
+                    )
+                if catalog_class is None:
+                    logger.debug(f"Catalog class is unknown for {catalog}; using regular listing")
+                    return False
+                is_iceberg = catalog_class in _ICEBERG_ONLY_CATALOG_CLASSES
+                self._catalog_class_cache[cache_key] = is_iceberg
+                return is_iceberg
+        except (AnalysisException, IllegalArgumentException, Py4JError, RuntimeError) as exc:
+            logger.debug(
+                f"Catalog class detection failed for {catalog}; using regular listing: {exc}"
+            )
+            return False
+
+    # CCCS two listing queries regardless of table count; metadata is fetched only when needed.
+    def _list_relations_fast(self, schema_relation: BaseRelation) -> List[BaseRelation]:
+        """List persistent Iceberg tables and views without per-relation DESCRIBE."""
+        view_rows: List["agate.Row"] = []
+        try:
+            _, tables = self.execute(f"show tables in {schema_relation} like '*'", fetch=True)
+            if not self._table_only_mode:
+                _, views = self.execute(f"show views in {schema_relation} like '*'", fetch=True)
+                view_rows = [row for row in views if not row[2]]
+        except DbtRuntimeError as exc:
+            if any(msg in exc.msg for msg in SCHEMA_NOT_FOUND_MESSAGES):
+                return []
+            raise
+
+        view_identifiers = {(row[0], row[1]) for row in view_rows}
+        relations: List[BaseRelation] = [
+            self.Relation.create(
+                database=schema_relation.database,
+                schema=schema_relation.schema,
+                identifier=row[1],
+                quote_policy=asdict(schema_relation.quote_policy),
+                include_policy={**asdict(schema_relation.include_policy), "identifier": True},
+                type=RelationType("table"),
+                information="",
+                is_delta=False,
+                is_hudi=False,
+                is_iceberg=True,
+            )
+            for row in tables
+            if not row[2] and (row[0], row[1]) not in view_identifiers
+        ]
+        relations.extend(
+            self.Relation.create(
+                database=schema_relation.database,
+                schema=schema_relation.schema,
+                identifier=row[1],
+                quote_policy=asdict(schema_relation.quote_policy),
+                include_policy={**asdict(schema_relation.include_policy), "identifier": True},
+                type=RelationType("view"),
+                information="",
+                is_delta=False,
+                is_hudi=False,
+                is_iceberg=False,
+            )
+            for row in view_rows
+        )
+        return relations
+
+    def _list_relations_using_describe(
+        self, kwargs: Dict[str, Any], schema_relation: BaseRelation
+    ) -> List[BaseRelation]:
+        rows = self.execute_macro(LIST_RELATIONS_SHOW_TABLES_MACRO_NAME, kwargs=kwargs)
+        iceberg_catalog = self._catalog_is_iceberg_only(schema_relation.database)
+        if iceberg_catalog:
+            rows = rows.where(lambda row: not row[2])
+        relations = self._build_spark_relation_list(
+            row_list=rows,
+            relation_info_func=self._get_relation_information_using_describe,
+            schema_relation=schema_relation,
+        )
+        if iceberg_catalog and not self._table_only_mode:
+            _, views = self.execute(f"show views in {schema_relation} like '*'", fetch=True)
+            view_relations = self._build_spark_relation_list(
+                row_list=views.where(lambda row: not row[2]),
+                relation_info_func=self._get_relation_information_using_describe,
+                schema_relation=schema_relation,
+            )
+            view_relations = [
+                view.incorporate(type=RelationType.View, is_iceberg=False)
+                for view in view_relations
+            ]
+            view_names = {view.identifier for view in view_relations}
+            relations = [
+                relation for relation in relations if relation.identifier not in view_names
+            ]
+            relations.extend(view_relations)
+        return relations
+
+    # CCCS v2-first: uses SHOW TABLES + DESCRIBE EXTENDED, falls back to SHOW TABLE EXTENDED
+    def _list_relations_v2_first(
+        self, kwargs: Dict[str, Any], schema_relation: BaseRelation
+    ) -> List[BaseRelation]:
+        """SHOW TABLES + DESCRIBE EXTENDED (v2) first, SHOW TABLE EXTENDED (v1) fallback."""
+        try:
+            return self._list_relations_using_describe(kwargs, schema_relation)
+        except DbtRuntimeError as e:
+            errmsg = getattr(e, "msg", "")
+            if any(msg in errmsg for msg in SCHEMA_NOT_FOUND_MESSAGES) or any(
+                msg in errmsg for msg in TABLE_OR_VIEW_NOT_FOUND_MESSAGES
+            ):
+                return []
+            if "not supported" not in errmsg.lower() and "UNSUPPORTED_" not in errmsg:
+                raise
+            logger.debug(
+                f"v2 relation listing failed for {schema_relation}, "
+                f"falling back to SHOW TABLE EXTENDED: {errmsg}"
+            )
+
+        # Fallback to v1: SHOW TABLE EXTENDED
+        try:
             show_table_extended_rows = self.execute_macro(LIST_RELATIONS_MACRO_NAME, kwargs=kwargs)
             return self._build_spark_relation_list(
                 row_list=show_table_extended_rows,
                 relation_info_func=self._get_relation_information,
-                # CCCS pass BaseRelation to get destination database
                 schema_relation=schema_relation,
             )
         except DbtRuntimeError as e:
             errmsg = getattr(e, "msg", "")
-            if f"Database '{schema_relation}' not found" in errmsg:
+            if any(msg in errmsg for msg in SCHEMA_NOT_FOUND_MESSAGES) or any(
+                msg in errmsg for msg in TABLE_OR_VIEW_NOT_FOUND_MESSAGES
+            ):
                 return []
-            # Iceberg compute engine behavior: show table
+            raise
+
+    # CCCS v1-first: uses SHOW TABLE EXTENDED, falls back to v2 on 'not supported for v2 tables'
+    def _list_relations_v1_first(
+        self, kwargs: Dict[str, Any], schema_relation: BaseRelation
+    ) -> List[BaseRelation]:
+        """SHOW TABLE EXTENDED (v1) first, SHOW TABLES + DESCRIBE EXTENDED (v2) fallback."""
+        try:
+            show_table_extended_rows = self.execute_macro(LIST_RELATIONS_MACRO_NAME, kwargs=kwargs)
+            return self._build_spark_relation_list(
+                row_list=show_table_extended_rows,
+                relation_info_func=self._get_relation_information,
+                schema_relation=schema_relation,
+            )
+        except DbtRuntimeError as e:
+            errmsg = getattr(e, "msg", "")
+            if any(msg in errmsg for msg in SCHEMA_NOT_FOUND_MESSAGES) or any(
+                msg in errmsg for msg in TABLE_OR_VIEW_NOT_FOUND_MESSAGES
+            ):
+                return []
+            # Iceberg v2 tables: https://issues.apache.org/jira/browse/SPARK-33393
             elif "SHOW TABLE EXTENDED is not supported for v2 tables" in errmsg:
                 # this happens with spark-iceberg with v2 iceberg tables
                 # https://issues.apache.org/jira/browse/SPARK-33393
                 try:
-                    # Iceberg behavior: 3-row result of relations obtained
-                    show_table_rows = self.execute_macro(
-                        LIST_RELATIONS_SHOW_TABLES_MACRO_NAME, kwargs=kwargs
-                    )
-                    return self._build_spark_relation_list(
-                        row_list=show_table_rows,
-                        relation_info_func=self._get_relation_information_using_describe,
-                        # CCCS pass BaseRelation to get destination database
-                        schema_relation=schema_relation,
-                    )
+                    return self._list_relations_using_describe(kwargs, schema_relation)
                 except DbtRuntimeError as e:
-                    description = "Error while retrieving information about"
-                    logger.debug(f"{description} {schema_relation}: {e.msg}")
-                    return []
+                    if any(msg in e.msg for msg in SCHEMA_NOT_FOUND_MESSAGES):
+                        return []
+                    raise
             else:
-                logger.debug(
-                    f"Error while retrieving information about {schema_relation}: {errmsg}"
-                )
-                return []
+                raise
 
     def get_relation(self, database: str, schema: str, identifier: str) -> Optional[BaseRelation]:
         if not self.Relation.get_default_include_policy().database:
@@ -342,6 +814,7 @@ class SparkAdapter(SQLAdapter):
                 column=column["col_name"],
                 column_index=idx,
                 dtype=column["data_type"],
+                comment=column["comment"],
             )
             for idx, column in enumerate(rows)
         ]
@@ -406,30 +879,18 @@ class SparkAdapter(SQLAdapter):
         return columns
 
     def _get_columns_for_catalog(self, relation: BaseRelation) -> Iterable[Dict[str, Any]]:
-        # CCCS
-        if relation.is_iceberg:
-            # Iceberg information column does not contain the relation's schema (columns)
-            # Instead of parsing the information column we use the get_columns_in_relation macro
-            # this macro executes 'describe extended <table name>' which returns the column
-            # names and their type
-            rows: List[agate.Row] = super().get_columns_in_relation(relation)
-            columns = self.parse_describe_extended(relation, rows)
-            for column in columns:
-                # convert SparkColumns into catalog dicts
-                as_dict = column.to_column_dict()
-                as_dict["column_name"] = as_dict.pop("column", None)
-                as_dict["column_type"] = as_dict.pop("dtype")
-                as_dict["table_database"] = relation.database if relation.is_iceberg else None
-                yield as_dict
-        else:
-            columns = self.parse_columns_from_information(relation)
+        # Iceberg presentation metadata does not contain a parseable column schema.
+        columns = [] if relation.is_iceberg else self.parse_columns_from_information(relation)
+
+        if not columns:
+            columns = self.get_columns_in_relation(relation)
 
         for column in columns:
             # convert SparkColumns into catalog dicts
             as_dict = column.to_column_dict()
             as_dict["column_name"] = as_dict.pop("column", None)
             as_dict["column_type"] = as_dict.pop("dtype")
-            as_dict["table_database"] = None
+            as_dict["table_database"] = relation.database
             yield as_dict
 
     def get_catalog(
@@ -508,7 +969,7 @@ class SparkAdapter(SQLAdapter):
                 database=relation.database,
                 schema=relation.schema,
                 identifier=relation.identifier,
-                type=RelationType.Table,
+                type=RelationType.Table,  # type: ignore[arg-type]
                 information=relation.information,
                 is_delta=False,
                 is_iceberg=True,
@@ -616,6 +1077,321 @@ class SparkAdapter(SQLAdapter):
     def debug_query(self) -> None:
         """Override for DebugTask method"""
         self.execute("select 1 as id")
+
+    @available
+    def validate_write_order_config(
+        self, config: Mapping[str, Any], model_name: str = "model"
+    ) -> WriteOrder:
+        missing = object()
+        value = config.get("write_order", missing)
+        if value is missing:
+            return WriteOrder()
+        try:
+            order = WriteOrder.from_config(value)
+            if (config.get("file_format") or "iceberg") != "iceberg":
+                raise ValueError("write_order is only supported for Iceberg models")
+            if config.get("materialized") not in ("table", "incremental"):
+                raise ValueError(
+                    "write_order is only supported for batch table/incremental models"
+                )
+            return order
+        except ValueError as exc:
+            raise CompilationError(f"Invalid write_order for model {model_name}: {exc}") from exc
+
+    def _write_order_execute(self, sql: str) -> Sequence[Sequence[Any]]:
+        _, table = self.execute(sql, fetch=True)
+        return list(table.rows)
+
+    @staticmethod
+    def _write_order_target(relation: BaseRelation) -> str:
+        return ".".join(
+            quote_identifier(part)
+            for key, part in (
+                ("database", relation.database),
+                ("schema", relation.schema),
+                ("identifier", relation.identifier),
+            )
+            if part and getattr(relation.include_policy, key)
+        )
+
+    @available.parse(lambda *a, **k: False)
+    def write_order_enabled(
+        self, relation: Optional[BaseRelation], config: Mapping[str, Any]
+    ) -> bool:
+        self.validate_write_order_config(config)
+        explicit = "write_order" in config
+        if (config.get("file_format") or "iceberg") != "iceberg":
+            return False
+        properties = config.get("tblproperties") or {}
+        try:
+            return WriteOrderManager(self._write_order_execute).enabled(
+                self._write_order_target(relation) if relation else None, explicit, properties
+            )
+        except (ValueError, KeyError, StopIteration) as exc:
+            raise DbtRuntimeError(f"Cannot configure write_order for {relation}: {exc}") from exc
+
+    @available.parse(lambda *a, **k: None)
+    def get_write_order_relation(self, relation: SparkRelation) -> SparkRelation:
+        try:
+            current = WriteOrderManager(self._write_order_execute).current(
+                self._write_order_target(relation)
+            )
+        except (ValueError, KeyError, StopIteration) as exc:
+            raise DbtRuntimeError(f"Cannot establish write_order for {relation}: {exc}") from exc
+        return replace(relation, write_order=current)
+
+    @available.parse(lambda *a, **k: None)
+    def sync_write_order(
+        self, relation: SparkRelation, config: Mapping[str, Any]
+    ) -> SparkRelation:
+        desired = self.validate_write_order_config(config)
+        try:
+            current = WriteOrderManager(self._write_order_execute).sync(
+                self._write_order_target(relation), desired
+            )
+        except (ValueError, KeyError, StopIteration) as exc:
+            raise DbtRuntimeError(f"Cannot synchronize write_order for {relation}: {exc}") from exc
+        return replace(relation, write_order=current)
+
+    @available.parse(lambda *a, **k: None)
+    def validate_write_order_schema(
+        self, relation: BaseRelation, source: BaseRelation, config: Mapping[str, Any]
+    ) -> None:
+        desired = self.validate_write_order_config(config)
+        manager = WriteOrderManager(self._write_order_execute)
+        target = self._write_order_target(relation)
+        source_name = self._write_order_target(source)
+
+        def create_empty(name: str, owner: str) -> None:
+            version = manager.metadata(target)["format-version"]
+            manager.execute(
+                f"CREATE TABLE {name} USING iceberg "
+                f"TBLPROPERTIES ('format-version'={sql_string(str(version))}, "
+                f"'dbt.write-order-owner'={sql_string(owner)}) "
+                f"AS SELECT * FROM {source_name} WHERE false"
+            )
+
+        try:
+            manager.validate_on_probe(target, desired, create_empty)
+        except (ValueError, KeyError, StopIteration, RuntimeError) as exc:
+            raise DbtRuntimeError(f"Invalid write_order schema for {relation}: {exc}") from exc
+
+    @available
+    def write_order_python_code(self) -> str:
+        return Path(write_order_module.__file__).read_text(encoding="utf-8")
+
+    @available.parse(lambda *a, **k: None)
+    def materialize_write_order_sql(
+        self,
+        relation: BaseRelation,
+        query: str,
+        clauses: str,
+        location: str,
+        config: Mapping[str, Any],
+        exists: bool,
+    ) -> AdapterResponse:
+        desired = self.validate_write_order_config(config)
+        properties = {
+            str(key): str(value)
+            for key, value in (config.get("tblproperties") or {}).items()
+            if not key.startswith("polaris_")
+        }
+        target = self._write_order_target(relation)
+        query = query.strip().rstrip(";")
+        manager = WriteOrderManager(self._write_order_execute)
+        response: Optional[AdapterResponse] = None
+        if exists and "format-version" not in properties:
+            properties["format-version"] = str(manager.metadata(target)["format-version"])
+
+        def create_empty(name: str, owner: str) -> None:
+            props = dict(properties, **{"dbt.write-order-owner": owner})
+            rendered = ", ".join(f"{sql_string(k)} = {sql_string(v)}" for k, v in props.items())
+            manager.execute(
+                f"CREATE TABLE {name} {clauses} {location if name == target else ''} "
+                f"TBLPROPERTIES ({rendered}) "
+                f"AS SELECT * FROM ({query}) AS __dbt_schema WHERE false"
+            )
+
+        def write(replace: bool) -> None:
+            nonlocal response
+            if replace:
+                rendered = ", ".join(
+                    f"{sql_string(k)} = {sql_string(v)}" for k, v in properties.items()
+                )
+                props = f"TBLPROPERTIES ({rendered})" if rendered else ""
+                response, _ = self.execute(
+                    f"CREATE OR REPLACE TABLE {target} {clauses} {location} {props} AS {query}"
+                )
+            else:
+                response, _ = self.execute(f"INSERT INTO {target} {query}")
+
+        try:
+            manager.materialize(target, desired, exists, create_empty, write)
+        except (ValueError, KeyError, StopIteration, RuntimeError) as exc:
+            raise DbtRuntimeError(
+                f"write_order materialization of {target} failed: {exc}"
+            ) from exc
+        if response is None:
+            raise DbtRuntimeError(
+                f"write_order materialization of {target} did not write model data"
+            )
+        return response
+
+    @available.parse(lambda *a, **k: None)
+    def get_tblproperties_diff(
+        self, relation: BaseRelation, desired_tblproperties: Optional[Dict[str, str]]
+    ) -> Optional[TblPropertiesDiff]:
+        """Compare desired tblproperties with existing ones and return a structured diff.
+
+        Returns None if no changes are needed.  The diff carries both properties to SET
+        and properties to UNSET so callers can issue the appropriate ALTER statements.
+        """
+        desired = TblPropertiesProcessor.from_relation_config(desired_tblproperties)
+
+        # Fetch existing properties from the server
+        existing_table = self.execute_macro("fetch_tbl_properties", kwargs={"relation": relation})
+        existing = TblPropertiesProcessor.from_relation_results(existing_table)
+
+        return TblPropertiesProcessor.get_diff(desired, existing)
+
+    @available.parse(lambda *a, **k: False)
+    def claim_metadata_sync(self, relation: BaseRelation, invocation_id: str) -> bool:
+        """Return True only for the first caller per relation per invocation.
+
+        dbt-core runs microbatch batch 0 sequentially before any concurrent batch,
+        so the first claimer is always the batch that can safely mutate metadata.
+        """
+        key = (str(invocation_id), str(relation))
+        with self._metadata_sync_lock:
+            if key in self._metadata_sync_claims:
+                return False
+            self._metadata_sync_claims.add(key)
+            return True
+
+    @staticmethod
+    def _parse_table_comment(rows: Iterable[Any]) -> str:
+        """Extract the table comment from DESCRIBE EXTENDED output, or "" if unset."""
+        in_detailed_info = False
+        for row in rows:
+            name = (row["col_name"] or "").strip()
+            if name == KEY_DETAILED_TABLE_INFORMATION:
+                in_detailed_info = True
+            elif in_detailed_info and name == KEY_TABLE_COMMENT:
+                return row["data_type"] or ""
+        return ""
+
+    @available.parse(lambda *a, **k: None)
+    def get_persist_docs_diff(
+        self,
+        relation: BaseRelation,
+        model_description: Optional[str],
+        model_columns: Optional[Dict[str, Any]],
+        for_relation: bool,
+        for_columns: bool,
+    ) -> Dict[str, Any]:
+        """Compare model docs with the existing relation using a single DESCRIBE EXTENDED.
+
+        Returns {"relation_comment": str or None (None = unchanged), "columns": {...}}.
+        """
+        check_relation = for_relation and not relation.is_view
+        check_columns = for_columns and bool(model_columns)
+        diff: Dict[str, Any] = {"relation_comment": None, "columns": {}}
+        if not check_relation and not check_columns:
+            return diff
+
+        rows = self.execute_macro(
+            GET_COLUMNS_IN_RELATION_RAW_MACRO_NAME, kwargs={"relation": relation}
+        )
+
+        if check_relation:
+            desired = model_description or ""
+            if desired != self._parse_table_comment(rows):
+                diff["relation_comment"] = desired
+
+        if check_columns and model_columns:
+            existing_columns = self.parse_describe_extended(relation, rows)
+            diff["columns"] = self.get_persist_doc_columns(existing_columns, model_columns)
+
+        return diff
+
+    @available
+    def get_persist_doc_columns(
+        self, existing_columns: List[SparkColumn], columns: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Returns only columns whose comments differ from existing state.
+
+        Compares the desired description from model config against the current
+        column comment in the database, using case-insensitive column name matching.
+        Only columns that need an update are returned.
+        """
+        return_columns: Dict[str, Any] = {}
+
+        # Case-insensitive lookup: lower(model_col_name) -> original_model_col_name
+        columns_lower = {k.lower(): k for k in columns.keys()}
+
+        for column in existing_columns:
+            name = column.column
+            name_lower = name.lower()
+            if name_lower in columns_lower:
+                original_column_name = columns_lower[name_lower]
+                config_column = columns[original_column_name]
+                if isinstance(config_column, dict):
+                    comment = config_column.get("description", "")
+                elif hasattr(config_column, "description"):
+                    comment = config_column.description or ""
+                else:
+                    continue
+                if comment != (column.comment or ""):
+                    return_columns[name] = columns[original_column_name]
+
+        return return_columns
+
+    @available.parse(lambda *a, **k: None)
+    def check_partition_sync(
+        self, relation: BaseRelation, file_format: Optional[str], partition_by: Optional[object]
+    ) -> None:
+        """Check if the model's partition_by config matches the existing Iceberg table partitions.
+
+        Only runs if:
+        - The check_partition_sync behavior flag is enabled
+        - The file_format is 'iceberg'
+
+        If partitions are out of sync:
+        - Raises DbtRuntimeError if check_partition_sync_raises is True
+        - Logs a warning otherwise
+        """
+        if not self.behavior.check_partition_sync:
+            return
+
+        if file_format != "iceberg":
+            return
+
+        # Fetch existing partition spec from SHOW CREATE TABLE
+        show_create_result = self.execute_macro(
+            "fetch_partition_spec", kwargs={"relation": relation}
+        )
+        case_sensitive = False
+        if self.config.credentials.method == SparkConnectionMethod.SESSION:
+            from dbt.adapters.spark.session import get_spark_session
+
+            spark = get_spark_session(self.config.credentials.server_side_parameters)
+            case_sensitive = spark.conf.get("spark.sql.caseSensitive").lower() == "true"
+        existing = PartitionProcessor.from_show_create_table(
+            show_create_result, case_sensitive=case_sensitive
+        )
+        desired = PartitionProcessor.from_model_config(partition_by, case_sensitive=case_sensitive)
+
+        if PartitionProcessor.is_out_of_sync(desired, existing):
+            diff_msg = PartitionProcessor.describe_diff(desired, existing)
+            message = (
+                f"Partition drift detected on {relation}.\n"
+                f"{diff_msg}\n"
+                f"The model's partition_by config does not match the existing table partition spec."
+            )
+            if self.behavior.check_partition_sync_raises:
+                raise DbtRuntimeError(message)
+            else:
+                logger.warning(message)
 
     @classmethod
     def _get_adapter_specific_run_info(cls, config: RelationConfig) -> Dict[str, Any]:

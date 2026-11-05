@@ -4,7 +4,19 @@ from __future__ import annotations
 
 import datetime as dt
 from types import TracebackType
-from typing import Any, Dict, List, Optional, Tuple, Union, Sequence
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+    Type,
+    Union,
+    Sequence,
+)
 
 from dbt.adapters.spark.connections import SparkConnectionWrapper
 from dbt.adapters.events.logging import AdapterLogger
@@ -18,6 +30,14 @@ logger = AdapterLogger("Spark")
 NUMBERS = DECIMALS + (int, float)
 
 
+# CCCS share configured session acquisition with catalog detection.
+def get_spark_session(server_side_parameters: Dict[str, Any]) -> SparkSession:
+    builder = SparkSession.builder
+    for parameter, value in server_side_parameters.items():
+        builder = builder.config(parameter, value)
+    return builder.getOrCreate()
+
+
 class Cursor:
     """
     Mock a pyodbc cursor.
@@ -27,22 +47,28 @@ class Cursor:
     https://github.com/mkleehammer/pyodbc/wiki/Cursor
     """
 
-    def __init__(self, *, server_side_parameters: Optional[Dict[str, Any]] = None) -> None:
+    def __init__(
+        self,
+        *,
+        server_side_parameters: Optional[Dict[str, Any]] = None,
+        prepare_session: Optional[Callable[[SparkSession], None]] = None,
+    ) -> None:
         self._df: Optional[DataFrame] = None
-        self._rows: Optional[List[Row]] = None
+        self._rows: Optional[Iterator[Row]] = None
         self.server_side_parameters = server_side_parameters or {}
+        self.prepare_session = prepare_session
 
     def __enter__(self) -> Cursor:
         return self
 
     def __exit__(
         self,
-        exc_type: Optional[BaseException],
-        exc_val: Optional[Exception],
+        exc_type: Optional[Type[BaseException]],
+        exc_val: Optional[BaseException],
         exc_tb: Optional[TracebackType],
-    ) -> bool:
+    ) -> Literal[False]:
         self.close()
-        return True
+        return False
 
     @property
     def description(
@@ -110,16 +136,13 @@ class Cursor:
         ------
         https://github.com/mkleehammer/pyodbc/wiki/Cursor#executesql-parameters
         """
+        self.close()
         if len(parameters) > 0:
             sql = sql % parameters
 
-        # CCCS
-        builder = SparkSession.builder
-
-        for parameter, value in self.server_side_parameters.items():
-            builder = builder.config(parameter, value)
-
-        spark_session = builder.getOrCreate()
+        spark_session = get_spark_session(self.server_side_parameters)
+        if self.prepare_session is not None:
+            self.prepare_session(spark_session)
 
         try:
             self._df = spark_session.sql(sql)
@@ -140,8 +163,8 @@ class Cursor:
         https://github.com/mkleehammer/pyodbc/wiki/Cursor#fetchall
         """
         if self._rows is None and self._df is not None:
-            self._rows = self._df.collect()
-        return self._rows
+            self._rows = self._df.toLocalIterator()
+        return list(self._rows) if self._rows is not None else None
 
     def fetchone(self) -> Optional[Row]:
         """
@@ -157,14 +180,8 @@ class Cursor:
         https://github.com/mkleehammer/pyodbc/wiki/Cursor#fetchone
         """
         if self._rows is None and self._df is not None:
-            self._rows = self._df.take(1)
-
-        if self._rows is not None and len(self._rows) > 0:
-            row = self._rows.pop(0)
-        else:
-            row = None
-
-        return row
+            self._rows = self._df.toLocalIterator()
+        return next(self._rows, None) if self._rows is not None else None
 
 
 class Connection:
@@ -178,6 +195,7 @@ class Connection:
 
     def __init__(self, *, server_side_parameters: Optional[Dict[Any, str]] = None) -> None:
         self.server_side_parameters = server_side_parameters or {}
+        self.prepare_session: Optional[Callable[[SparkSession], None]] = None
 
     def cursor(self) -> Cursor:
         """
@@ -188,7 +206,10 @@ class Connection:
         out : Cursor
             The cursor.
         """
-        return Cursor(server_side_parameters=self.server_side_parameters)
+        return Cursor(
+            server_side_parameters=self.server_side_parameters,
+            prepare_session=self.prepare_session,
+        )
 
 
 class SessionConnectionWrapper(SparkConnectionWrapper):

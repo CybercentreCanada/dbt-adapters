@@ -1,5 +1,8 @@
 import os
+from uuid import uuid4
+
 import pytest
+
 from dbt.tests.util import run_dbt, write_file
 from dbt.tests.adapter.python_model.test_python_model import (
     BasePythonModelTests,
@@ -44,6 +47,40 @@ class TestPythonIncrementalModelSpark(BasePythonIncrementalTests):
     @pytest.fixture(scope="class")
     def project_config_update(self):
         return {}
+
+
+@pytest.mark.skip_profile(
+    "apache_spark", "spark_session", "databricks_sql_endpoint", "spark_http_odbc"
+)
+class TestPythonIncrementalModelLocationSpark(BasePythonIncrementalTests):
+    @pytest.fixture(scope="class")
+    def project_config_update(self):
+        return {
+            "models": {
+                "+incremental_strategy": "merge",
+                "+submission_method": "job_cluster",
+                "+file_format": "iceberg",
+                "+location_root": f"dbfs:/tmp/dbt-spark-{uuid4().hex}",
+            }
+        }
+
+    def test_incremental(self, project):
+        run_dbt(["run"])
+        run_dbt(["run"])
+
+        temp_relation = project.adapter.Relation.create(
+            database=project.database,
+            schema=project.test_schema,
+            identifier="incremental__dbt_tmp",
+        )
+        assert (
+            project.adapter.get_relation(
+                database=temp_relation.database,
+                schema=temp_relation.schema,
+                identifier=temp_relation.identifier,
+            )
+            is None
+        )
 
 
 models__simple_python_model = """

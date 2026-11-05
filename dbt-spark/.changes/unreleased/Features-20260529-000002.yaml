@@ -1,0 +1,10 @@
+kind: Features
+body: Add partition drift detection for Iceberg incremental merge models. Two new flags
+  (`check_partition_sync` and `check_partition_sync_raises`) compare the model's configured
+  partition transform expressions against the existing table spec fetched via `SHOW
+  CREATE TABLE`. When a mismatch is detected dbt logs a warning or raises an error
+  depending on flag configuration.
+time: 2026-05-29T00:00:00.000000-08:00
+custom:
+  Author: cccs
+  Issue: "0"

@@ -1,0 +1,5 @@
+kind: Fixes
+body: Honor location_root for Iceberg Python writes using a DataFrameWriterV2 table property, with local integration coverage for physical incremental staging and temporary-view compatibility.
+time: 2026-11-04T10:57:22.008936618-05:00
+custom:
+    Author: cccs-jn
