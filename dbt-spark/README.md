@@ -146,6 +146,225 @@ for configuration, execution and conversion rules, session-sharing assumptions,
 dependency requirements, and limitations including timeout, cleanup, and
 replacement behavior.
 
+### SQL and Python Scalar Functions with Polaris
+
+This fork supports **session-scoped** dbt function resources on Apache Spark
+**4.1.3** with an Apache Polaris Iceberg REST catalog. SQL functions use Spark's
+native `CREATE OR REPLACE TEMPORARY FUNCTION`; Python functions use
+`spark.udf.register`. They execute in Spark, **not** in Polaris, and are removed
+when the dbt invocation finishes.
+
+Install this adapter and a function-capable dbt-core runtime:
+
+```sh
+pip install -e '.[session]' 'pyspark==4.1.3' 'dbt-core>=1.11,<2'
+```
+
+The tested combination is Spark 4.1.3, Iceberg 1.12.0, and Polaris 1.8.0.
+The native dbt integration was verified with dbt-core 1.14.0a1; the minimum
+function-capable dbt-core release is not independently certified here.
+Provision compatible Python interpreters and imported libraries on the driver
+and executors. `runtime_version` validates the driver; it does not install an
+interpreter or dependencies.
+
+#### Configure the Spark session and REST catalog
+
+For example, in your dbt profile:
+
+```yaml
+spark_polaris:
+  target: dev
+  outputs:
+    dev:
+      type: spark
+      method: session
+      host: localhost
+      schema: analytics
+      threads: 4
+      server_side_parameters:
+        spark.master: "local[2]"
+        spark.jars.packages: "org.apache.iceberg:iceberg-spark-runtime-4.1_2.13:1.12.0,org.apache.iceberg:iceberg-aws-bundle:1.12.0"
+        spark.sql.catalog.polaris: org.apache.iceberg.spark.SparkCatalog
+        spark.sql.catalog.polaris.type: rest
+        spark.sql.catalog.polaris.uri: "{{ env_var('POLARIS_CATALOG_URI') }}"
+        spark.sql.catalog.polaris.warehouse: "{{ env_var('POLARIS_CATALOG_NAME') }}"
+        spark.sql.catalog.polaris.rest.auth.type: oauth2
+        spark.sql.catalog.polaris.oauth2-server-uri: "{{ env_var('POLARIS_TOKEN_URI') }}"
+        spark.sql.catalog.polaris.credential: "{{ env_var('POLARIS_CLIENT_CREDENTIAL') }}"
+        spark.sql.catalog.polaris.scope: "PRINCIPAL_ROLE:ALL"
+        spark.sql.catalog.polaris.io-impl: org.apache.iceberg.aws.s3.S3FileIO
+        spark.sql.defaultCatalog: polaris
+```
+
+`POLARIS_CATALOG_URI` is the catalog API base URI, commonly
+`https://<host>/api/catalog`; `POLARIS_TOKEN_URI` is the complete OAuth token
+endpoint, commonly `https://<host>/api/catalog/v1/oauth/tokens`.
+`POLARIS_CLIENT_CREDENTIAL` has the `client_id:client_secret` format.
+`warehouse` is the Polaris catalog name, not an S3 path. Grant the principal
+access to that catalog and configure storage credentials/credential vending as
+required by your deployment. REST authentication alone does not grant Spark
+access to S3. The example uses S3; other storage requires its compatible
+Iceberg FileIO integration. Keep secrets in environment variables, not source
+control.
+
+**Parser limitation:** omit `IcebergSparkSessionExtensions` from
+`spark.sql.extensions` for SQL UDFs with the tested Iceberg 1.12.0 runtime.
+That extension throws `UnsupportedOperationException` in `parseRoutineParam`.
+The adapter reports this configuration error; it does not silently remove the
+extension. Use a fresh Spark process after changing static extension settings.
+Extension-specific Iceberg statements are not supported in this configuration.
+
+Without the Iceberg extension, this runtime also lacks persistent view
+discovery. Explicitly opt into **table-only** metadata discovery in
+`dbt_project.yml`:
+
+```yaml
+profile: spark_polaris
+flags:
+  spark_table_only: true
+models:
+  +database: polaris
+  +file_format: iceberg
+  +submission_method: spark_session_based_cluster
+  +location_root: "{{ env_var('DBT_MODEL_LOCATION_ROOT') }}"
+functions:
+  +spark_function_scope: session
+```
+
+`spark_table_only` defaults to `false`. When enabled it omits persistent views
+from discovery/catalog output, rejects `view` and `materialized_view`
+materializations, and uses table-only v2 discovery even if
+`use_v2_relation_listing` is disabled. It does not discover or manage existing
+views; use a namespace reserved for dbt tables, without conflicting view names.
+Other profiles retain normal view discovery. This flag does not affect temporary
+views used internally for Python incremental staging.
+
+The catalog belongs in the model `database` configuration, not the profile
+`database` field. `DBT_MODEL_LOCATION_ROOT` must be a writable storage parent
+inside the Polaris catalog's allowed locations. Function registration has no
+storage location.
+
+#### Define functions and build them with their consumers
+
+Create SQL function source under `functions/double_amount.sql`:
+
+```sql
+amount * 2
+```
+
+Create Python function source under `functions/multiply_amount.py`:
+
+```python
+if amount is None or multiplier is None:
+    return None
+return amount * multiplier
+```
+
+Declare properties in `functions/schema.yml` (the example driver uses Python
+3.12; change the runtime declaration to match your interpreter):
+
+```yaml
+functions:
+  - name: double_amount
+    arguments:
+      - name: amount
+        data_type: INT
+    returns:
+      data_type: INT
+  - name: multiply_amount
+    config:
+      runtime_version: "3.12"
+      entry_point: multiply_amount_impl
+    arguments:
+      - name: amount
+        data_type: INT
+      - name: multiplier
+        data_type: INT
+    returns:
+      data_type: INT
+```
+
+Python source is a **function body**, not `model(dbt, spark)` and not a complete
+named handler. `entry_point` names the generated wrapper. Arguments preserve
+their declared order; the Spark return type is explicit. Python argument type
+metadata does not enforce a warehouse-style input signature.
+
+Create `models/amount_report.sql`:
+
+```sql
+{{ config(materialized='table') }}
+select {{ function('double_amount') }}(3) as doubled,
+       {{ function('multiply_amount') }}(3, 4) as multiplied
+```
+
+Build the functions and consumers in **one invocation**:
+
+```sh
+dbt build --select +amount_report
+```
+
+`function()` creates native dbt DAG dependencies and renders an unqualified,
+quoted name. The adapter replays successfully built definitions into each actual
+consuming Spark session. Functions with the same alias in different dbt
+schemas/packages still collide because temporary functions are not namespaced.
+Existing Spark/user functions are not overwritten.
+
+Session Python models may use these registered names through Spark SQL or
+`selectExpr`. The current dbt Python API has **no `dbt.function()` method**.
+Establish ordering through `dbt.ref()` to a SQL model that references the UDFs:
+
+```python
+def model(dbt, spark):
+    dbt.config(materialized="table")
+    upstream = dbt.ref("amount_report")
+    return upstream.selectExpr("`double_amount`(3) as doubled")
+```
+
+Build that Python consumer with its ancestors as well.
+Literal Spark function names alone do not create dbt dependencies.
+
+**Limitations:** no persistent Polaris UDF deployment, cross-engine access,
+function grants, persistent function documentation, overloads, argument
+defaults, aggregate/table/JavaScript/vectorized functions, remote Python
+submission, or streaming consumers. Persistent views referencing temporary
+functions are not supported. SQL/Python nondeterminism is supported;
+`volatility: stable` is rejected. Python code is trusted executable project
+code, not a sandbox.
+
+A function-only build does not deploy anything for a later process. A subsequent
+model-only build or deferred function reference must rebuild required functions;
+`--defer` is not a deployment mechanism for session functions.
+
+See the [function registration specification](specs/spec-design-spark-sql-python-udf-registration.md)
+for interfaces, lifecycle, and tests.
+
+#### Validate function support
+
+From this adapter directory:
+
+```sh
+DBT_RUN_SPARK_FUNCTION_TESTS=1 hatch run local-spark-iceberg:python -m pytest \
+  --noconftest tests/unit/test_functions.py tests/unit/test_functions_live.py -n 0
+hatch run local-spark-iceberg:python -m pytest \
+  tests/functional/adapter/test_functions.py --profile spark_session -n 0
+```
+
+The real Polaris test uses a separately provisioned Polaris service/catalog:
+set `DBT_SPARK_POLARIS_URI`, `DBT_SPARK_POLARIS_CATALOG`,
+`DBT_SPARK_POLARIS_CREDENTIAL`, and, when needed,
+`DBT_SPARK_POLARIS_TOKEN_URI` and `DBT_SPARK_POLARIS_SCOPE`, then run:
+
+```sh
+hatch run local-spark-iceberg:python -m pytest \
+  tests/functional/adapter/test_functions.py --profile polaris -n 0
+```
+
+For local S3-compatible test storage, additionally set
+`DBT_SPARK_POLARIS_S3_ENDPOINT`, `DBT_SPARK_POLARIS_S3_ACCESS_KEY`, and
+`DBT_SPARK_POLARIS_S3_SECRET_KEY`. These are test-only inputs, never committed
+credentials. Without the Polaris URI/catalog variables, that integration test
+is skipped rather than treated as a pass.
+
 ### Fast Iceberg Relation Listing
 
 <!-- CCCS: session-only catalog detection and constant-query relation discovery. -->

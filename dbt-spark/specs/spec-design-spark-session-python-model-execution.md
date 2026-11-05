@@ -1,8 +1,8 @@
 ---
 title: dbt-spark Session-Based Python Model Execution
-version: "1.0"
+version: "1.1"
 date_created: 2026-11-04
-last_updated: 2026-11-04
+last_updated: 2026-11-05
 tags: [design, dbt-spark, python, session, materializations]
 ---
 
@@ -68,10 +68,11 @@ assumption at every submission.
   `get_spark_session(server_side_parameters)`, which applies configured builder
   parameters before calling `getOrCreate()`.
 - **REQ-003**: The session Python helper shall execute synchronously in the
-  current Python process. It shall obtain Spark using
-  `SparkSession.builder.getOrCreate()` and shall not submit a remote job.
-  Its constructor stores the parsed model but does not apply the supplied
-  credentials to the builder.
+  current Python process. It shall use an explicitly supplied Spark session
+  or obtain Spark using `get_spark_session(server_side_parameters)` with the
+  supplied credentials' builder parameters. It shall not submit a remote job.
+  For session UDF consumers, the adapter supplies the exact session in which
+  the invocation's functions have been registered.
 - **REQ-004**: Before execution, deep-copy the parsed model configuration into
   `model_config`, import `datetime` and `tzlocal`, and perform these literal
   replacements throughout the compiled source:
@@ -113,11 +114,11 @@ assumption at every submission.
   session submission. Conversely, selecting the session helper does not validate
   that SQL uses a session connection. Mixing it with remote SQL can leave data
   and temporary views inaccessible to subsequent SQL operations.
-- **CON-002**: Unlike SQL session acquisition, the Python helper does not call
-  `get_spark_session()` or apply `server_side_parameters`. Existing SQL/setup
-  work normally establishes the configured session. Direct helper execution
-  without that initialization may obtain an unconfigured session. No universal
-  identity guarantee across threads or explicitly created Spark sessions is made.
+- **CON-002**: SQL and Python acquisition apply the configured builder
+  parameters. There is still no universal identity guarantee across threads or
+  explicitly created Spark sessions. The session UDF path replays definitions
+  into each actual consuming session rather than assuming `getOrCreate()`
+  guarantees identity.
 - **CON-003**: The helper supplies no per-model interpreter/process isolation,
   package installation, Databricks library provisioning, job polling, retry,
   submission timeout, job handle, or Spark job-group cancellation.
@@ -221,7 +222,7 @@ this does not mean model code cannot subsequently change the live setting.
 | Interface | Contract |
 | --- | --- |
 | `submit_python_job(parsed_model, compiled_code)` | Select helper by model configuration, submit code, then produce adapter response. |
-| `SparkSessionBasedClusterPythonJobHelper(parsed_model, credential)` | Retain parsed model; credential is not applied by this constructor. |
+| `SparkSessionBasedClusterPythonJobHelper(parsed_model, credential, spark_session=None)` | Retain parsed model and configured builder parameters; optionally use the supplied registered session. |
 | `helper.submit(compiled_code)` | Synchronous local execution, `None` on success, chained runtime error on handled failure. |
 | `model(dbt, spark)` | Return a supported batch DataFrame; use `dbt.is_incremental` to branch according to compiled materialization context. |
 | `dbt.ref()` / `dbt.source()` | Resolve compiled reference dictionaries and invoke the injected loader; not dynamic arbitrary dbt graph lookup. |
@@ -266,8 +267,8 @@ isolation between independently concurrent dbt invocations.
   is selected.
 - **AC-002 (REQ-002, REQ-003, CON-002)**: Given configured server parameters,
   when the SQL cursor obtains Spark, then it applies them; when the Python
-  helper obtains Spark, then it calls builder `getOrCreate()` without applying
-  those credential parameters itself.
+  helper obtains Spark, then it applies those parameters through the same helper,
+  unless the adapter already supplied the exact registered session.
 - **AC-003 (REQ-004, REQ-005, CON-008)**: Given compiled UTC/local-timezone
   representations and generated functions using globals, when submitted, then
   the exact substitutions occur and the functions can access injected names.
@@ -426,8 +427,8 @@ temporary view before executing the merge.
 
 - Trace the source from base Python dispatch through the session helper to
   generated `py_write_table` code and incremental strategy execution.
-- Verify separate session-acquisition paths and avoid implying credentials are
-  applied by the Python helper.
+- Verify configured session acquisition and exact session hand-off for UDF
+  consumers; do not assume session identity across threads.
 - Preserve the output conversion order, error cause, response shape, and
   temporary-view lifetime documented here.
 - Check feature claims against the existing streaming, write-order, staging,

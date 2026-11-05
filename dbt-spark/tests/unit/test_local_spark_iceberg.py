@@ -118,6 +118,7 @@ def test_describe_listing_includes_persistent_iceberg_views(
     monkeypatch, v1_fallback, iceberg_catalog
 ):
     adapter = object.__new__(SparkAdapter)
+    adapter._behavior = SimpleNamespace(spark_table_only=False)
     schema = SparkRelation.create(database="iceberg", schema="test_schema")
     rows = agate.Table(
         [("test_schema", "orders", False), ("", "temp", True)],

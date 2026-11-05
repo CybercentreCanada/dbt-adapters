@@ -4,7 +4,19 @@ from __future__ import annotations
 
 import datetime as dt
 from types import TracebackType
-from typing import Any, Dict, Iterator, List, Literal, Optional, Tuple, Type, Union, Sequence
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+    Type,
+    Union,
+    Sequence,
+)
 
 from dbt.adapters.spark.connections import SparkConnectionWrapper
 from dbt.adapters.events.logging import AdapterLogger
@@ -35,10 +47,16 @@ class Cursor:
     https://github.com/mkleehammer/pyodbc/wiki/Cursor
     """
 
-    def __init__(self, *, server_side_parameters: Optional[Dict[str, Any]] = None) -> None:
+    def __init__(
+        self,
+        *,
+        server_side_parameters: Optional[Dict[str, Any]] = None,
+        prepare_session: Optional[Callable[[SparkSession], None]] = None,
+    ) -> None:
         self._df: Optional[DataFrame] = None
         self._rows: Optional[Iterator[Row]] = None
         self.server_side_parameters = server_side_parameters or {}
+        self.prepare_session = prepare_session
 
     def __enter__(self) -> Cursor:
         return self
@@ -123,6 +141,8 @@ class Cursor:
             sql = sql % parameters
 
         spark_session = get_spark_session(self.server_side_parameters)
+        if self.prepare_session is not None:
+            self.prepare_session(spark_session)
 
         try:
             self._df = spark_session.sql(sql)
@@ -175,6 +195,7 @@ class Connection:
 
     def __init__(self, *, server_side_parameters: Optional[Dict[Any, str]] = None) -> None:
         self.server_side_parameters = server_side_parameters or {}
+        self.prepare_session: Optional[Callable[[SparkSession], None]] = None
 
     def cursor(self) -> Cursor:
         """
@@ -185,7 +206,10 @@ class Connection:
         out : Cursor
             The cursor.
         """
-        return Cursor(server_side_parameters=self.server_side_parameters)
+        return Cursor(
+            server_side_parameters=self.server_side_parameters,
+            prepare_session=self.prepare_session,
+        )
 
 
 class SessionConnectionWrapper(SparkConnectionWrapper):

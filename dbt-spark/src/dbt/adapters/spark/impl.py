@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import threading
 from pathlib import Path
 from concurrent.futures import Future
@@ -43,6 +44,7 @@ from dbt.adapters.spark import SparkConnectionManager
 from dbt.adapters.spark import SparkRelation
 from dbt.adapters.spark import SparkColumn
 from dbt.adapters.spark.connections import SparkConnectionMethod
+from dbt.adapters.spark.functions import SparkFunction, SparkFunctionRegistry
 from dbt.adapters.spark.relation_configs.tblproperties import (
     TblPropertiesDiff,
     TblPropertiesProcessor,
@@ -145,6 +147,16 @@ AWAIT_TERMINATION = {
     ),
 }
 
+SPARK_TABLE_ONLY = {
+    "name": "spark_table_only",
+    "default": False,
+    "description": (
+        "Opt into table-only discovery and reject persistent view materializations. "
+        "Use with the native Spark parser for SQL UDFs when the Iceberg SQL extension "
+        "does not implement routine parameter parsing."
+    ),
+}
+
 logger = AdapterLogger("Spark")
 packages = ["pyhive.hive", "thrift.transport", "thrift.protocol"]
 log_level = os.getenv("DBT_SPARK_LOG_LEVEL", "ERROR")
@@ -183,6 +195,7 @@ _ICEBERG_ONLY_CATALOG_CLASSES = frozenset({"org.apache.iceberg.spark.SparkCatalo
 
 @dataclass
 class SparkConfig(AdapterConfig):
+    spark_function_scope: Optional[str] = None
     file_format: str = "iceberg"
     location_root: Optional[str] = None
     partition_by: Optional[Union[List[str], str]] = None
@@ -268,6 +281,113 @@ class SparkAdapter(SQLAdapter):
         # CCCS isolate classifications by actual session; serialize concurrent cache misses.
         self._catalog_class_cache: Dict[Tuple["SparkSession", str], bool] = {}
         self._catalog_class_lock = threading.Lock()
+        self._functions = SparkFunctionRegistry()
+        if self.type() == "spark" and isinstance(self.connections, SparkConnectionManager):
+            self.connections.session_prepare = self._functions.ensure
+
+    def _function_session(self) -> "SparkSession":
+        if self.config.credentials.method != SparkConnectionMethod.SESSION:
+            raise DbtRuntimeError("Spark session functions require a method: session profile")
+        from dbt.adapters.spark.session import get_spark_session
+
+        return get_spark_session(self.config.credentials.server_side_parameters)
+
+    @available
+    def validate_spark_function(
+        self, model: Mapping[str, Any], selected_functions: Sequence[Mapping[str, Any]]
+    ) -> None:
+        spark = self._function_session()
+        function = SparkFunction.from_model(model)
+        function.validate_session(spark)
+        self._functions.validate_names(spark, selected_functions)
+
+    @available
+    def spark_function_build_value(self, model: Mapping[str, Any]) -> Union[str, Dict[str, Any]]:
+        function = SparkFunction.from_model(model)
+        if function.language == "sql":
+            return function.sql()
+        return {"kind": "spark_python_udf", **asdict(function)}
+
+    @available
+    def register_spark_function(
+        self, model: Mapping[str, Any], build_value: Union[str, Mapping[str, Any]]
+    ) -> AdapterResponse:
+        function = SparkFunction.from_model(model)
+        expected = self.spark_function_build_value(model)
+        if build_value != expected:
+            raise DbtRuntimeError(
+                f"Invalid registration value for Spark function {function.unique_id}"
+            )
+        self._functions.build(self._function_session(), function)
+        return AdapterResponse(_message="OK")
+
+    def pre_model_hook(self, config: Mapping[str, Any]) -> Any:
+        self.validate_write_order_config(config, config.get("alias") or "model")
+        if self._table_only_mode and config.get("materialized") in ("view", "materialized_view"):
+            raise DbtRuntimeError(
+                "spark_table_only excludes persistent view materializations; "
+                "disable it only with a catalog/parser supporting view discovery"
+            )
+        context = super().pre_model_hook(config)
+        model = getattr(config, "model", None)
+        if self.type() != "spark" or model is None:
+            return context
+        dependencies = [dep for dep in model.depends_on.nodes if dep.startswith("function.")]
+        self._functions.require(dependencies)
+        if dependencies:
+            if model.config.materialized == "streaming":
+                raise DbtRuntimeError("Spark session functions do not support streaming consumers")
+            if (
+                model.language == "python"
+                and model.config.get("submission_method", self.default_python_submission_method)
+                != "spark_session_based_cluster"
+            ):
+                raise DbtRuntimeError("Spark session functions require session Python submission")
+            self._functions.ensure(self._function_session())
+        return context
+
+    @available
+    def cache_added(self, relation: Optional[BaseRelation]) -> str:
+        if self.type() == "spark" and relation is not None and relation.is_function:
+            return ""
+        return super().cache_added(relation)
+
+    def cleanup_connections(self) -> None:
+        active_error = sys.exc_info()[0] is not None
+        errors = self._functions.cleanup()
+        try:
+            super().cleanup_connections()
+        finally:
+            for error in errors:
+                logger.error(str(error))
+        if errors and not active_error:
+            raise errors[0]
+
+    def submit_python_job(self, parsed_model: dict, compiled_code: str) -> AdapterResponse:
+        submission = parsed_model["config"].get(
+            "submission_method", self.default_python_submission_method
+        )
+        if self.type() == "spark" and submission == "spark_session_based_cluster":
+            dependencies = [
+                dep
+                for dep in parsed_model.get("depends_on", {}).get("nodes", [])
+                if dep.startswith("function.")
+            ]
+            self._functions.require(dependencies)
+            if not dependencies and not self._functions.has_definitions:
+                return super().submit_python_job(parsed_model, compiled_code)
+            # Pass the actual registered session to the helper, not a second acquisition.
+            spark = self._function_session()
+            self._functions.ensure(spark)
+            helper = self.python_submission_helpers[submission](
+                parsed_model, self.config.credentials
+            )
+            if not isinstance(helper, SparkSessionBasedClusterPythonJobHelper):
+                raise DbtRuntimeError("Session Python submission requires a session-aware helper")
+            helper.spark_session = spark
+            helper.submit(compiled_code)
+            return self.generate_python_submission_response(None)
+        return super().submit_python_job(parsed_model, compiled_code)
 
     # CCCS register all behavior flags for partition drift and relation listing order
     @property
@@ -280,7 +400,12 @@ class SparkAdapter(SQLAdapter):
             SET_PARTITION_OVERWRITE_MODE,
             REQUIRE_LOCATION_ROOT,
             AWAIT_TERMINATION,
+            SPARK_TABLE_ONLY,
         ]
+
+    @property
+    def _table_only_mode(self) -> bool:
+        return self.type() == "spark" and bool(getattr(self.behavior, "spark_table_only", False))
 
     @classmethod
     def date_function(cls) -> str:
@@ -448,6 +573,16 @@ class SparkAdapter(SQLAdapter):
 
         kwargs = {"schema_relation": schema_relation}
 
+        if self._table_only_mode:
+            if self.behavior.iceberg_listing_fast and self._catalog_is_iceberg_only(
+                schema_relation.database
+            ):
+                return self._list_relations_fast(schema_relation)
+            return [
+                relation
+                for relation in self._list_relations_using_describe(kwargs, schema_relation)
+                if relation.is_table
+            ]
         if (
             self.behavior.use_v2_relation_listing
             and self.behavior.iceberg_listing_fast
@@ -504,15 +639,17 @@ class SparkAdapter(SQLAdapter):
     # CCCS two listing queries regardless of table count; metadata is fetched only when needed.
     def _list_relations_fast(self, schema_relation: BaseRelation) -> List[BaseRelation]:
         """List persistent Iceberg tables and views without per-relation DESCRIBE."""
+        view_rows: List["agate.Row"] = []
         try:
             _, tables = self.execute(f"show tables in {schema_relation} like '*'", fetch=True)
-            _, views = self.execute(f"show views in {schema_relation} like '*'", fetch=True)
+            if not self._table_only_mode:
+                _, views = self.execute(f"show views in {schema_relation} like '*'", fetch=True)
+                view_rows = [row for row in views if not row[2]]
         except DbtRuntimeError as exc:
             if any(msg in exc.msg for msg in SCHEMA_NOT_FOUND_MESSAGES):
                 return []
             raise
 
-        view_rows = [row for row in views if not row[2]]
         view_identifiers = {(row[0], row[1]) for row in view_rows}
         relations: List[BaseRelation] = [
             self.Relation.create(
@@ -559,7 +696,7 @@ class SparkAdapter(SQLAdapter):
             relation_info_func=self._get_relation_information_using_describe,
             schema_relation=schema_relation,
         )
-        if iceberg_catalog:
+        if iceberg_catalog and not self._table_only_mode:
             _, views = self.execute(f"show views in {schema_relation} like '*'", fetch=True)
             view_relations = self._build_spark_relation_list(
                 row_list=views.where(lambda row: not row[2]),
@@ -964,10 +1101,6 @@ class SparkAdapter(SQLAdapter):
     def _write_order_execute(self, sql: str) -> Sequence[Sequence[Any]]:
         _, table = self.execute(sql, fetch=True)
         return list(table.rows)
-
-    def pre_model_hook(self, config: Mapping[str, Any]) -> Any:
-        self.validate_write_order_config(config, config.get("alias") or "model")
-        return super().pre_model_hook(config)
 
     @staticmethod
     def _write_order_target(relation: BaseRelation) -> str:

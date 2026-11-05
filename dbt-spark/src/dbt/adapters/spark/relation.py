@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 
 from dbt.adapters.base.relation import BaseRelation, Policy
 from dbt.adapters.events.logging import AdapterLogger
+from dbt_common.exceptions import DbtRuntimeError
 from dbt.adapters.spark.relation_configs.write_order import CurrentWriteOrder
 
 logger = AdapterLogger("Spark")
@@ -49,6 +50,10 @@ class SparkRelation(BaseRelation):
 
     # CCCS
     def render(self) -> str:
+        if self.is_function:
+            if self.identifier is None:
+                raise DbtRuntimeError("A Spark function relation requires an identifier")
+            return self.quoted(self.identifier)
         # if self.include_policy.database and self.include_policy.schema:
         #     raise DbtRuntimeError(
         #         "Got a spark relation with schema and database set to "

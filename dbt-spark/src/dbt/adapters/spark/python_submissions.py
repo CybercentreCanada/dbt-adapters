@@ -1,7 +1,7 @@
 import base64
 import time
 import requests
-from typing import Any, Dict, Callable, Iterable
+from typing import Any, Dict, Callable, Iterable, Optional
 import uuid
 
 from dbt.adapters.base import PythonJobHelper
@@ -305,8 +305,15 @@ class SparkSessionBasedClusterPythonJobHelper(PythonJobHelper):
     Submit python to local spark driver session.
     """
 
-    def __init__(self, parsed_model: Dict, credential: SparkCredentials) -> None:
+    def __init__(
+        self,
+        parsed_model: Dict,
+        credential: SparkCredentials,
+        spark_session: Optional[SparkSession] = None,
+    ) -> None:
         self.parsed_model = parsed_model
+        self.server_side_parameters = credential.server_side_parameters
+        self.spark_session = spark_session
 
     def submit(self, compiled_code: str) -> None:
         try:
@@ -316,7 +323,9 @@ class SparkSessionBasedClusterPythonJobHelper(PythonJobHelper):
             # 1. Explicitly import tzlocal
             import tzlocal  # type: ignore[import-untyped]
 
-            spark = SparkSession.builder.getOrCreate()  # Local passed to compiled_code call
+            from dbt.adapters.spark.session import get_spark_session
+
+            spark = self.spark_session or get_spark_session(self.server_side_parameters)
             model_config = deepcopy(self.parsed_model.get("config"))
 
             # Fix the code if it contains invalid representations like <UTC>

@@ -30,7 +30,7 @@ from datetime import datetime
 import sqlparams
 from dbt_common.dataclass_schema import StrEnum
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Union, Tuple, List, Generator, Iterable, Sequence
+from typing import Any, Callable, Dict, Optional, Union, Tuple, List, Generator, Iterable, Sequence
 
 from abc import ABC, abstractmethod
 
@@ -425,6 +425,16 @@ class PyodbcConnectionWrapper(PyhiveConnectionWrapper):
 
 class SparkConnectionManager(SQLConnectionManager):
     TYPE = "spark"
+    session_prepare: Optional[Callable[[Any], None]] = None
+
+    def add_query(self, *args: Any, **kwargs: Any) -> Tuple[Connection, Any]:
+        if self.profile.credentials.method == SparkConnectionMethod.SESSION:
+            from dbt.adapters.spark.session import SessionConnectionWrapper
+
+            handle = self.get_thread_connection().handle
+            if isinstance(handle, SessionConnectionWrapper):
+                handle.handle.prepare_session = self.session_prepare
+        return super().add_query(*args, **kwargs)
 
     SPARK_CLUSTER_HTTP_PATH = "/sql/protocolv1/o/{organization}/{cluster}"
     SPARK_SQL_ENDPOINT_HTTP_PATH = "/sql/1.0/endpoints/{endpoint}"

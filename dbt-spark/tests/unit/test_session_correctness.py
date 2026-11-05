@@ -110,6 +110,7 @@ def test_context_exit_closes_without_suppressing_body_exception(cursor):
 @pytest.fixture
 def adapter(monkeypatch):
     instance = object.__new__(SparkAdapter)
+    instance._behavior = SimpleNamespace(spark_table_only=False)
     monkeypatch.setattr(instance, "_catalog_is_iceberg_only", lambda _: False)
     return instance
 
